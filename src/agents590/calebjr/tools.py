@@ -10,6 +10,8 @@ class Tools:
         help_texts = {
             "ls": "Usage: [ls](path)\nList the contents of a directory at the given path.",
             "cat": "Usage: [cat](path)\nDisplay the contents of a file at the given path.",
+            "edit": """Usage: [edit](path, old_text, new_text)
+            Replace one exact, unique text occurrence in a file.""",
             "write": """Usage: [write](path, content)
             Write the given content to a file at the given path.""",
             "delete": "Usage: [delete](path)\nDelete the file at the given path.",
@@ -20,6 +22,8 @@ class Tools:
             "rename": "Usage: [rename](src, dst)\nRename a file or directory from src to dst.",
             "search": """Usage: [search](query)
             Search for files or directories that match the given query.""",
+            "shell": """Usage: [shell](command)
+            Execute a shell command in the run's working directory.""",
             "help": "Usage: [help](tool_name)\nGet help on how to use the specified tool.",
         }
         return help_texts.get(tool_name, f"No help available for tool: {tool_name}")
@@ -43,6 +47,28 @@ class Tools:
                 return f.read()
         except Exception as e:
             return f"Error reading file {path}: {e}"
+
+    @staticmethod
+    def edit(path: str, old_text: str, new_text: str) -> str:
+        """Replace one exact, unique text occurrence in a file."""
+        try:
+            if not old_text:
+                raise ValueError("old_text must not be empty")
+
+            with open(path) as f:
+                content = f.read()
+
+            occurrences = content.count(old_text)
+            if occurrences == 0:
+                raise ValueError("old_text was not found")
+            if occurrences > 1:
+                raise ValueError(f"old_text is not unique; found {occurrences} occurrences")
+
+            with open(path, "w") as f:
+                f.write(content.replace(old_text, new_text, 1))
+            return f"Successfully edited {path}"
+        except Exception as e:
+            return f"Error editing file {path}: {e}"
 
     @staticmethod
     def write(path: str, content: str) -> str:
@@ -145,3 +171,37 @@ class Tools:
                             Note: More than 100 matches found; only showing the first 100."""
                         )
         return "\n".join(matches) if matches else f"No matches found for query: {query}"
+
+    @staticmethod
+    def shell(command: str, *, cwd: str) -> str:
+        """Execute a shell command in the supplied working directory."""
+        import subprocess
+
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=cwd,
+                shell=True,
+                text=True,
+                capture_output=True,
+                timeout=120,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as e:
+            output = "\n".join(
+                part.decode(errors="replace").strip()
+                for part in (e.stdout or "", e.stderr or "")
+                if part
+            )
+            suffix = f"\n{output}" if output else ""
+            return f"Command timed out after 120 seconds.{suffix}"
+        except Exception as e:
+            return f"Error executing command: {e}"
+
+        output = "\n".join(
+            part.strip() for part in (completed.stdout, completed.stderr) if part.strip()
+        )
+        if completed.returncode == 0:
+            return output or "Command completed successfully."
+        suffix = f"\n{output}" if output else ""
+        return f"Command failed with exit code {completed.returncode}.{suffix}"
