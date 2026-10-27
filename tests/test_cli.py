@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 
 from agents590 import cli
+from agents590.calebjr import CalebJR
+from agents590.calebjr import repl as calebjr_repl
 from agents590.contracts import RunContext
 
 
@@ -78,6 +80,35 @@ def test_cli_passes_instruction_workdir_and_model_to_the_selected_agent(
     )
     assert seen == [(instruction, RunContext(cwd=tmp_path, model="openai/selected-deployment"))]
     assert capsys.readouterr().out == "completed\n"
+
+
+def test_interactive_cli_allows_no_initial_instruction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[tuple[CalebJR, RunContext, str | None]] = []
+    agent = CalebJR()
+
+    async def fake_repl(
+        selected_agent: CalebJR,
+        context: RunContext,
+        *,
+        initial_instruction: str | None = None,
+    ) -> int:
+        seen.append((selected_agent, context, initial_instruction))
+        return 0
+
+    monkeypatch.setattr(cli, "create_agent", lambda name: agent)
+    monkeypatch.setattr(calebjr_repl, "run_repl", fake_repl)
+
+    assert cli.main(["calebjr", "--interactive", "--cwd", str(tmp_path)]) == 0
+    assert seen == [(agent, RunContext(cwd=tmp_path), None)]
+
+
+def test_interactive_cli_rejects_noninteractive_agent(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert cli.main(["krisj_echo", "--interactive"]) == 1
+    assert "does not support interactive sessions" in capsys.readouterr().err
 
 
 def test_starter_scaffold_fails_explicitly(capsys: pytest.CaptureFixture[str]) -> None:

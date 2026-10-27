@@ -90,12 +90,12 @@ class UNCOpenAISettings:
             max_retries=0,
         )
 
-    def create_async_client(self) -> AsyncOpenAI:
-        """Provide the same routing for the future Harbor model/tool loop."""
+    def create_async_client(self, *, timeout: float = 30.0) -> AsyncOpenAI:
+        """Provide the same routing with an explicit, per-client timeout override."""
         return AsyncOpenAI(
             api_key=self.api_key,
             base_url=_base_url(self.endpoint),
             default_headers={"Authorization": f"Bearer {self.api_key}"},
-            timeout=30.0,
+            timeout=timeout,
             max_retries=0,
         )
