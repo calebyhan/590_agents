@@ -1,14 +1,16 @@
 """Versioned, redacted, atomic persistence for CalebJR sessions."""
 
+import hashlib
 import json
 import os
 import re
+import shutil
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
-from agents590.calebjr.redaction import redact_data
+from agents590.calebjr.redaction import redact_data, redact_text
 
 SCHEMA_VERSION = 1
 MAX_SAVED_SESSIONS = 50
@@ -52,6 +54,39 @@ def json_value(value: Any) -> Any:  # noqa: ANN401
     return str(value)
 
 
+def save_artifact(session_file: Path, content: str) -> tuple[Path, str]:
+    """Atomically save redacted oversized output under a content hash."""
+    safe_content = redact_text(content)
+    if len(safe_content) > 100_000:
+        omitted = len(safe_content) - 100_000
+        safe_content = f"{safe_content[:100_000]}\n… ({omitted:,} characters omitted)"
+    digest = hashlib.sha256(safe_content.encode("utf-8")).hexdigest()
+    directory = session_file.with_suffix(".artifacts")
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = directory / f"{digest}.txt"
+    if path.exists():
+        return path, digest
+    fd, temporary = tempfile.mkstemp(prefix=f".{digest}.", dir=directory)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(safe_content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+    return path, digest
+
+
 def save_envelope(path: Path, envelope: dict[str, Any]) -> Path:
     """Write a private session file atomically."""
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -77,6 +112,7 @@ def save_envelope(path: Path, envelope: dict[str, Any]) -> Path:
             )
             for expired in saved[MAX_SAVED_SESSIONS:]:
                 expired.unlink(missing_ok=True)
+                shutil.rmtree(expired.with_suffix(".artifacts"), ignore_errors=True)
     except BaseException:
         try:
             os.unlink(temporary)

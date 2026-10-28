@@ -1,5 +1,9 @@
 """Module for tools used by the calebjr agent."""
 
+import asyncio
+import os
+import signal
+
 
 class Tools:
     """A class containing tools for the calebjr agent."""
@@ -173,8 +177,70 @@ class Tools:
         return "\n".join(matches) if matches else f"No matches found for query: {query}"
 
     @staticmethod
+    async def shell_async(command: str, *, cwd: str, timeout: float = 120.0) -> str:
+        """Execute a cancellable shell command in the supplied working directory."""
+        try:
+            process = await asyncio.create_subprocess_shell(
+                command,
+                cwd=cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=os.name != "nt",
+            )
+
+            async def stop() -> None:
+                try:
+                    if os.name == "nt":
+                        process.terminate()
+                    else:
+                        os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    return
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=1.0)
+                except TimeoutError:
+                    try:
+                        if os.name == "nt":
+                            process.kill()
+                        else:
+                            os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    await process.wait()
+
+            try:
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+            except TimeoutError:
+                await stop()
+                stdout, stderr = await process.communicate()
+                output = "\n".join(
+                    part.decode(errors="replace").strip()
+                    for part in (stdout, stderr)
+                    if part.strip()
+                )
+                return f"Command timed out after {timeout:g} seconds." + (
+                    f"\n{output}" if output else ""
+                )
+            except asyncio.CancelledError:
+                await stop()
+                raise
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            return f"Error executing command: {error}"
+
+        output = "\n".join(
+            part.decode(errors="replace").strip() for part in (stdout, stderr) if part.strip()
+        )
+        if process.returncode == 0:
+            return output or "Command completed successfully."
+        return f"Command failed with exit code {process.returncode}." + (
+            f"\n{output}" if output else ""
+        )
+
+    @staticmethod
     def shell(command: str, *, cwd: str) -> str:
-        """Execute a shell command in the supplied working directory."""
+        """Execute a shell command synchronously in the supplied working directory."""
         import subprocess
 
         try:
@@ -187,21 +253,21 @@ class Tools:
                 timeout=120,
                 check=False,
             )
-        except subprocess.TimeoutExpired as e:
+        except subprocess.TimeoutExpired as error:
             output = "\n".join(
                 part.decode(errors="replace").strip()
-                for part in (e.stdout or "", e.stderr or "")
+                for part in (error.stdout or "", error.stderr or "")
                 if part
             )
-            suffix = f"\n{output}" if output else ""
-            return f"Command timed out after 120 seconds.{suffix}"
-        except Exception as e:
-            return f"Error executing command: {e}"
+            return "Command timed out after 120 seconds." + (f"\n{output}" if output else "")
+        except Exception as error:
+            return f"Error executing command: {error}"
 
         output = "\n".join(
             part.strip() for part in (completed.stdout, completed.stderr) if part.strip()
         )
         if completed.returncode == 0:
             return output or "Command completed successfully."
-        suffix = f"\n{output}" if output else ""
-        return f"Command failed with exit code {completed.returncode}.{suffix}"
+        return f"Command failed with exit code {completed.returncode}." + (
+            f"\n{output}" if output else ""
+        )

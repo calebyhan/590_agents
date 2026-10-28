@@ -6,6 +6,8 @@ from io import StringIO
 from rich.console import Console
 
 from agents590.calebjr.events import (
+    DestructiveConfirmationFinished,
+    DestructiveConfirmationStarted,
     ModelTextDelta,
     Progress,
     ToolFinished,
@@ -68,3 +70,22 @@ def test_rich_renderer_modes_control_detail() -> None:
     assert "working" not in quiet_text
     assert "hidden" not in quiet_text
     assert "answer" in quiet_text
+
+
+def test_rich_renderer_handles_resize_and_confirmation_events() -> None:
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, width=80)
+    renderer = RichRenderer(console)
+
+    async def render() -> None:
+        await renderer(DestructiveConfirmationStarted("rm a-very-long-file-name.txt"))
+        console.width = 20
+        await renderer(DestructiveConfirmationFinished("rm a-very-long-file-name.txt", False))
+        console.width = 120
+        await renderer(TurnFinished("session remains usable"))
+
+    asyncio.run(render())
+    text = output.getvalue()
+    assert "Confirm destructive" in text
+    assert "declined" in text
+    assert "session remains usable" in text

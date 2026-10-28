@@ -14,11 +14,14 @@ from agents590.calebjr import CalebJR
 from agents590.calebjr.redaction import bounded, redact_text
 from agents590.calebjr.render import PlainRenderer, RenderMode, terminal_renderer
 from agents590.calebjr.session import CalebJRSession
+from agents590.calebjr.transcript import session_path, sessions_dir
 from agents590.contracts import RunContext
 
 _HELP = """Commands:
   /help        Show this help.
-  /context     Show bounded session context statistics.
+  /context       Show bounded session context statistics.
+  /context --raw Show bounded, redacted canonical model context.
+  /status      Show token usage, estimated cost, and safety status.
   /transcript  Show conversation and tool activity.
   /compact     Summarize older completed turns.
   /model NAME  Change the model for later turns.
@@ -39,6 +42,8 @@ INTERACTIVE_MAX_REPEATED_CALLS = 8
 _COMMANDS = [
     "/help",
     "/context",
+    "/context --raw",
+    "/status",
     "/transcript",
     "/compact",
     "/model",
@@ -68,6 +73,7 @@ async def run_repl(
     initial_instruction: str | None = None,
     render_mode: RenderMode = "default",
     resume: str | Path | None = None,
+    confirm_destructive: bool = False,
 ) -> int:
     """Run one stateful session; injectable I/O keeps tests deterministic."""
     interactive_terminal = input_fn is None and output_fn is print and write_fn is None
@@ -86,6 +92,37 @@ async def run_repl(
         if interactive_terminal
         else PlainRenderer(output_fn, write=write_fn, mode=render_mode)
     )
+    prompt_session: PromptSession[str] | None = None
+
+    async def confirm(command: str) -> bool:
+        try:
+            if prompt_session is not None:
+                answer = await prompt_session.prompt_async("Execute? [y/N] ")
+            else:
+                if input_fn is None:
+                    return False
+                answer = input_fn("Execute? [y/N] ")
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return answer.strip().lower() in {"y", "yes"}
+
+    allow_external_resume = False
+    if resume is not None:
+        candidate = session_path(resume)
+        if not candidate.is_relative_to(sessions_dir().resolve()):
+            output_fn(f"Session file is outside the CalebJR data directory:\n{candidate}")
+            try:
+                if input_fn is None:
+                    answer = await asyncio.to_thread(input, "Trust and load it? [y/N] ")
+                else:
+                    answer = input_fn("Trust and load it? [y/N] ")
+            except (EOFError, KeyboardInterrupt):
+                answer = ""
+            allow_external_resume = answer.strip().lower() in {"y", "yes"}
+            if not allow_external_resume:
+                output_fn("Session load cancelled.")
+                return 1
+
     if resume is None:
         session = agent.create_session(
             context,
@@ -95,6 +132,7 @@ async def run_repl(
             max_tool_failures=INTERACTIVE_MAX_TOOL_FAILURES,
             max_repeated_calls=INTERACTIVE_MAX_REPEATED_CALLS,
         )
+        session.confirm_destructive = confirm if confirm_destructive else None
     else:
         session = CalebJRSession.resume(
             resume,
@@ -105,20 +143,21 @@ async def run_repl(
             max_invalid_responses=INTERACTIVE_MAX_INVALID_RESPONSES,
             max_tool_failures=INTERACTIVE_MAX_TOOL_FAILURES,
             max_repeated_calls=INTERACTIVE_MAX_REPEATED_CALLS,
+            confirm_destructive=confirm if confirm_destructive else None,
+            allow_external=allow_external_resume,
         )
     session.event_sink = renderer
-    prompt_session: PromptSession[str] | None = None
     if input_fn is None:
-        toolbar = f" {session.model}  |  {session.cwd}  |  {render_mode} "
         prompt_session = PromptSession(
             history=FileHistory(str(_history_file())),
             completer=WordCompleter(_COMMANDS, sentence=True),
             complete_while_typing=True,
-            bottom_toolbar=toolbar,
+            bottom_toolbar=session.toolbar_summary,
         )
 
     output_fn(f"CalebJR · {session.cwd.name} · {session.model}")
     output_fn("Type /help for commands.")
+    interrupt_pending = False
     try:
         if initial_instruction and initial_instruction.strip():
             await session.run_turn(initial_instruction)
@@ -132,8 +171,12 @@ async def run_repl(
             except EOFError:
                 break
             except KeyboardInterrupt:
-                output_fn("Use /exit to quit.")
+                if interrupt_pending:
+                    break
+                interrupt_pending = True
+                output_fn("Press Ctrl-C again to quit, or enter a prompt to continue.")
                 continue
+            interrupt_pending = False
             instruction = line.strip()
             if not instruction:
                 continue
@@ -145,6 +188,12 @@ async def run_repl(
                 continue
             if command == "/context":
                 output_fn(session.context_summary())
+                continue
+            if command == "/context --raw":
+                output_fn(session.raw_context())
+                continue
+            if command == "/status":
+                output_fn(session.status_summary())
                 continue
             if command == "/transcript":
                 if not session.visible_transcript:
@@ -204,6 +253,8 @@ async def run_repl(
             try:
                 await session.run_turn(instruction)
             except (KeyboardInterrupt, asyncio.CancelledError):
+                interrupt_pending = True
+                output_fn("Turn cancelled. Press Ctrl-C again to quit.")
                 continue
     finally:
         await session.close()

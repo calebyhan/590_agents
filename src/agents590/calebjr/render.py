@@ -16,6 +16,8 @@ from rich.text import Text
 
 from agents590.calebjr.events import (
     ContextCompacted,
+    DestructiveConfirmationFinished,
+    DestructiveConfirmationStarted,
     ModelTextDelta,
     Progress,
     ReasoningSummary,
@@ -119,6 +121,11 @@ class PlainRenderer:
             if self.mode != "quiet" or not event.approved:
                 message = "✓ safety review approved" if event.approved else f"! {event.decision}"
                 self.line(message)
+        elif isinstance(event, DestructiveConfirmationStarted):
+            self.line(f"? confirm destructive command:\n{event.command}")
+        elif isinstance(event, DestructiveConfirmationFinished):
+            if not event.approved:
+                self.line("! destructive command declined")
         elif isinstance(event, TurnFinished):
             if self.mode == "quiet" or self._response_text != event.text:
                 self.line(event.text)
@@ -262,6 +269,13 @@ class RichRenderer:
                 style = "green" if event.approved else "red"
                 marker = "✓ Approved" if event.approved else "! Rejected"
                 self._print(Text(f"{marker}: {event.decision}", style=style))
+        elif isinstance(event, DestructiveConfirmationStarted):
+            self._print(
+                Panel(event.command, title="Confirm destructive command", border_style="red")
+            )
+        elif isinstance(event, DestructiveConfirmationFinished):
+            if not event.approved:
+                self._print(Text("! Destructive command declined", style="red"))
         elif isinstance(event, TurnFinished):
             self._stop_status()
             self._stop_live()

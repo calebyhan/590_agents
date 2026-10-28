@@ -26,6 +26,7 @@ from agents590.calebjr.repl import (
     run_repl,
 )
 from agents590.calebjr.session import CalebJRSession
+from agents590.calebjr.transcript import SCHEMA_VERSION, save_envelope
 from agents590.contracts import RunContext
 from agents590.provider import UNCOpenAISettings
 
@@ -202,7 +203,7 @@ def test_scripted_repl_reuses_session_and_selects_120_second_timeout(tmp_path: P
     (tmp_path / "note.txt").write_text("remember me")
     settings = ClientCreatingSettings()
     agent = FakeAgent(settings)
-    lines = iter(["read the note", "what did it say?", "/context", "/exit"])
+    lines = iter(["read the note", "what did it say?", "/context", "/status", "/exit"])
     output: list[str] = []
 
     result = asyncio.run(
@@ -225,6 +226,7 @@ def test_scripted_repl_reuses_session_and_selects_120_second_timeout(tmp_path: P
     assert "first answer" in output
     assert "second answer" in output
     assert any("Session: 2 user turns, 1 tool events" in line for line in output)
+    assert any("Destructive confirmation: disabled" in line for line in output)
     assert {"role": "user", "content": "read the note"} in settings.client.responses.inputs[-1]
 
 
@@ -272,6 +274,66 @@ def test_scripted_repl_eof_exits_and_closes_session(tmp_path: Path) -> None:
         )
         == 0
     )
+    assert settings.client.closed
+
+
+def test_repl_requires_confirmation_for_external_resume(tmp_path: Path) -> None:
+    external = tmp_path / "external.json"
+    save_envelope(
+        external,
+        {
+            "version": SCHEMA_VERSION,
+            "session_id": "external",
+            "cwd": str(tmp_path),
+            "model": "test-model",
+            "history": [{"role": "system", "content": "system"}],
+            "transcript": [],
+        },
+    )
+    settings = ClientCreatingSettings()
+    agent = FakeAgent(settings)
+    lines = iter(["yes", "/exit"])
+    output: list[str] = []
+    assert (
+        asyncio.run(
+            run_repl(
+                agent,
+                RunContext(cwd=tmp_path),
+                input_fn=lambda prompt: next(lines),
+                output_fn=output.append,
+                resume=external,
+            )
+        )
+        == 0
+    )
+    assert any("outside the CalebJR data directory" in line for line in output)
+    assert settings.client.closed
+
+
+def test_scripted_repl_second_ctrl_c_exits(tmp_path: Path) -> None:
+    settings = ClientCreatingSettings()
+    agent = FakeAgent(settings)
+    calls = 0
+    output: list[str] = []
+
+    def interrupt(prompt: str) -> str:
+        nonlocal calls
+        calls += 1
+        raise KeyboardInterrupt
+
+    assert (
+        asyncio.run(
+            run_repl(
+                agent,
+                RunContext(cwd=tmp_path),
+                input_fn=interrupt,
+                output_fn=output.append,
+            )
+        )
+        == 0
+    )
+    assert calls == 2
+    assert any("again to quit" in line for line in output)
     assert settings.client.closed
 
 

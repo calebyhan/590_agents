@@ -9,6 +9,7 @@ import pytest
 from openai import AsyncOpenAI
 
 from agents590.calebjr.events import CollectingEventSink, ContextCompacted
+from agents590.calebjr.pricing import UsageRecord
 from agents590.calebjr.session import CalebJRSession
 from agents590.calebjr.transcript import SCHEMA_VERSION, save_envelope
 from agents590.contracts import RunContext
@@ -60,6 +61,8 @@ def test_compaction_retains_recent_turns_and_emits_event(tmp_path: Path) -> None
     assert asyncio.run(session.compact())
 
     assert "[Context compaction summary]" in str(session.history[1])
+    assert "User goals and constraints" in str(session.history[1])
+    assert "Important results and errors" in str(session.history[1])
     assert {"role": "user", "content": "recent one"} in session.history
     assert {"role": "user", "content": "recent two"} in session.history
     compacted = [event for event in events.events if isinstance(event, ContextCompacted)]
@@ -139,5 +142,96 @@ def test_resume_rejects_pending_call_before_creating_client(
 
     settings = CountingSettings()
     with pytest.raises(ValueError, match="pending tool call"):
-        CalebJRSession.resume(path, settings=cast(UNCOpenAISettings, settings))
+        CalebJRSession.resume(path, settings=cast(UNCOpenAISettings, settings), allow_external=True)
     assert settings.calls == 0
+
+
+def test_usage_survives_save_and_resume(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    session = make_session(tmp_path)
+    session.usage.records.append(UsageRecord("gpt-6.1-terra", input_tokens=100, output_tokens=20))
+    path = session.save("usage")
+
+    resumed = CalebJRSession.resume(
+        path,
+        settings=cast(UNCOpenAISettings, FakeSettings()),
+        client=cast(AsyncOpenAI, FakeClient()),
+    )
+    assert resumed.usage.input_tokens == 100
+    assert resumed.usage.output_tokens == 20
+
+
+def test_large_outputs_are_saved_as_private_redacted_hashed_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("OPENAI_API_KEY", "artifact-secret")
+    session = make_session(tmp_path)
+    output = "x" * 21_000 + " artifact-secret"
+    session.history.append({"type": "function_call_output", "call_id": "large", "output": output})
+    session.visible_transcript.append(("tool", output))
+
+    path = session.save("artifacts")
+    artifacts = list(path.with_suffix(".artifacts").glob("*.txt"))
+    assert len(artifacts) == 1
+    artifact = artifacts[0]
+    assert len(artifact.stem) == 64
+    assert "artifact-secret" not in artifact.read_text(encoding="utf-8")
+    assert "[REDACTED]" in artifact.read_text(encoding="utf-8")
+    assert artifact.stat().st_mode & 0o077 == 0
+    payload = path.read_text(encoding="utf-8")
+    assert artifact.name in payload
+    assert "sha256=" in payload
+
+
+def test_external_resume_requires_explicit_trust(tmp_path: Path) -> None:
+    path = tmp_path / "external.json"
+    save_envelope(
+        path,
+        {
+            "version": SCHEMA_VERSION,
+            "cwd": str(tmp_path),
+            "model": "test-model",
+            "history": [{"role": "system", "content": "system"}],
+            "transcript": [],
+        },
+    )
+    with pytest.raises(ValueError, match="explicit trust"):
+        CalebJRSession.resume(
+            path,
+            settings=cast(UNCOpenAISettings, FakeSettings()),
+            client=cast(AsyncOpenAI, FakeClient()),
+        )
+
+
+def test_resume_rejects_missing_cwd_and_incompatible_version(tmp_path: Path) -> None:
+    missing = tmp_path / "missing.json"
+    save_envelope(
+        missing,
+        {
+            "version": SCHEMA_VERSION,
+            "cwd": str(tmp_path / "gone"),
+            "model": "test-model",
+            "history": [{"role": "system", "content": "system"}],
+            "transcript": [],
+        },
+    )
+    with pytest.raises(ValueError, match="no longer exists"):
+        CalebJRSession.resume(
+            missing,
+            settings=cast(UNCOpenAISettings, FakeSettings()),
+            client=cast(AsyncOpenAI, FakeClient()),
+            allow_external=True,
+        )
+
+    incompatible = tmp_path / "future.json"
+    incompatible.write_text(
+        json.dumps({"version": SCHEMA_VERSION + 1, "history": [], "transcript": []})
+    )
+    with pytest.raises(ValueError, match="Unsupported session format"):
+        CalebJRSession.resume(
+            incompatible,
+            settings=cast(UNCOpenAISettings, FakeSettings()),
+            client=cast(AsyncOpenAI, FakeClient()),
+            allow_external=True,
+        )

@@ -39,6 +39,17 @@ class SafetyReviewFinished:
 
 
 @dataclass(frozen=True)
+class DestructiveConfirmationStarted:
+    command: str
+
+
+@dataclass(frozen=True)
+class DestructiveConfirmationFinished:
+    command: str
+    approved: bool
+
+
+@dataclass(frozen=True)
 class Progress:
     text: str
 
@@ -78,6 +89,8 @@ type SessionEvent = (
     | ToolFinished
     | SafetyReviewStarted
     | SafetyReviewFinished
+    | DestructiveConfirmationStarted
+    | DestructiveConfirmationFinished
     | Progress
     | ContextCompacted
     | ModelTextDelta

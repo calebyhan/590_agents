@@ -6,9 +6,11 @@ import os
 import re
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from contextlib import chdir
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -16,6 +18,8 @@ from openai import AsyncOpenAI
 
 from agents590.calebjr.events import (
     ContextCompacted,
+    DestructiveConfirmationFinished,
+    DestructiveConfirmationStarted,
     EventCallback,
     ModelTextDelta,
     Progress,
@@ -30,14 +34,17 @@ from agents590.calebjr.events import (
     TurnStarted,
     discard_event,
 )
-from agents590.calebjr.redaction import bounded
+from agents590.calebjr.pricing import UsageLedger, UsageRecord
+from agents590.calebjr.redaction import bounded, redact_data
 from agents590.calebjr.tools import Tools
 from agents590.calebjr.transcript import (
     SCHEMA_VERSION,
     json_value,
     load_envelope,
+    save_artifact,
     save_envelope,
     session_path,
+    sessions_dir,
     timestamp,
 )
 from agents590.contracts import RunContext
@@ -96,6 +103,7 @@ class CalebJRSession:
     MAX_TOOL_OUTPUT = 100_000
     MAX_PERSISTED_TRANSCRIPT_ITEM = 20_000
     MAX_PERSISTED_EVENTS = 2_000
+    MAX_PERSISTED_ARTIFACTS = 50
 
     def __init__(
         self,
@@ -109,6 +117,8 @@ class CalebJRSession:
         max_tool_failures: int = MAX_TOOL_FAILURES,
         max_repeated_calls: int = MAX_REPEATED_CALLS,
         client: AsyncOpenAI | None = None,
+        confirm_destructive: Callable[[str], Awaitable[bool]] | None = None,
+        confine_filesystem: bool = True,
     ) -> None:
         self.settings = settings
         self.context = context
@@ -143,6 +153,9 @@ class CalebJRSession:
         self.user_turn_count: int = 0
         self.assistant_turn_count: int = 0
         self.tool_call_count: int = 0
+        self.usage = UsageLedger()
+        self.confirm_destructive = confirm_destructive
+        self.confine_filesystem = confine_filesystem
         self._goal: str | None = None
 
     async def __aenter__(self) -> "CalebJRSession":
@@ -190,6 +203,7 @@ class CalebJRSession:
                 "Error ",
                 "Command failed ",
                 "Command timed out ",
+                "Command not executed:",
                 "Safety review failed",
                 "Safety review rejected",
             )
@@ -232,6 +246,7 @@ class CalebJRSession:
                 store=False,
                 background=False,
             )
+            self.usage.add_response(response, model=safety_model, safety=True)
             decision = (response.output_text or "").strip()
             result = (
                 "APPROVE"
@@ -320,6 +335,32 @@ class CalebJRSession:
             response = cast(Any, await self.client.responses.create(**arguments))
             return response, False
 
+    def _confined_tool_args(self, name: str, args: dict[str, str]) -> dict[str, str]:
+        """Resolve filesystem arguments and reject cwd and symlink escapes."""
+        if not self.confine_filesystem or name in {"shell", "search", "help"}:
+            return args
+        keys = ("src", "dst") if name in {"move", "copy", "rename"} else ("path",)
+        confined = dict(args)
+        root = self.cwd.resolve()
+        for key in keys:
+            candidate = Path(args[key]).expanduser()
+            resolved = (candidate if candidate.is_absolute() else root / candidate).resolve()
+            if not resolved.is_relative_to(root):
+                raise ValueError(f"{key} escapes the working directory: {args[key]}")
+            confined[key] = str(resolved)
+        return confined
+
+    async def _confirm_command(self, command: str) -> bool:
+        if self.confirm_destructive is None:
+            return True
+        await self._emit(DestructiveConfirmationStarted(command))
+        try:
+            approved = await self.confirm_destructive(command)
+        except (Exception, KeyboardInterrupt):
+            approved = False
+        await self._emit(DestructiveConfirmationFinished(command, approved))
+        return approved
+
     async def run_turn(self, instruction: str) -> TurnResult:
         """Run one turn, retaining complete response/tool history for the next turn."""
         if not instruction.strip():
@@ -348,6 +389,7 @@ class CalebJRSession:
                     text = f"Model request failed: {error}"
                     await self._emit(TurnFailed(text))
                     return await self._finish(text)
+                self.usage.add_response(response, model=self.model)
                 if not streamed_reasoning:
                     await self._emit_response_reasoning(response)
                 self.history.extend(self._history_item(item) for item in response.output)
@@ -422,16 +464,18 @@ class CalebJRSession:
                         command = args["command"]
                         if self.requires_safety_review(command):
                             review = await self.safety_review(instruction, command)
-                            result = (
-                                Tools.shell(command, cwd=str(self.cwd))
-                                if review == "APPROVE"
-                                else review
-                            )
+                            if review != "APPROVE":
+                                result = review
+                            elif not await self._confirm_command(command):
+                                result = "Command not executed: user confirmation declined."
+                            else:
+                                result = await Tools.shell_async(command, cwd=str(self.cwd))
                         else:
-                            result = Tools.shell(command, cwd=str(self.cwd))
+                            result = await Tools.shell_async(command, cwd=str(self.cwd))
                     else:
+                        confined_args = self._confined_tool_args(call.name, args)
                         with chdir(self.cwd):
-                            result = getattr(Tools, call.name)(**args)
+                            result = getattr(Tools, call.name)(**confined_args)
                 except Exception as error:
                     result = f"Tool error: {error}"
                 output = bounded(str(result), self.MAX_TOOL_OUTPUT)
@@ -501,14 +545,37 @@ class CalebJRSession:
         }
         if calls != outputs:
             return False
-        visible_cutoff = max(0, len(self.visible_transcript) - keep_recent_turns * 3)
-        summary_lines = [
-            f"- {role}: {bounded(text, 1_000)}"
-            for role, text in self.visible_transcript[:visible_cutoff]
-        ]
-        if not summary_lines:
-            summary_lines = [f"- {bounded(str(json_value(item)), 1_000)}" for item in older]
-        summary = "[Context compaction summary]\n" + bounded("\n".join(summary_lines), 12_000)
+        goals: list[str] = []
+        actions: list[str] = []
+        results: list[str] = []
+        assistant_notes: list[str] = []
+        for item in canonical:
+            if item.get("role") == "user":
+                goals.append(bounded(str(item.get("content", "")), 1_000))
+            elif item.get("role") == "assistant" or item.get("type") == "message":
+                assistant_notes.append(bounded(str(item.get("content", item)), 1_000))
+            elif item.get("type") == "function_call":
+                actions.append(
+                    f"{item.get('name', 'tool')}({bounded(str(item.get('arguments', '')), 500)})"
+                )
+            elif item.get("type") == "function_call_output":
+                results.append(bounded(str(item.get("output", "")), 1_000))
+
+        def section(title: str, values: list[str]) -> str:
+            lines = "\n".join(f"- {value}" for value in values) or "- none recorded"
+            return f"{title}:\n{lines}"
+
+        summary = "[Context compaction summary]\n" + bounded(
+            "\n\n".join(
+                [
+                    section("User goals and constraints", goals),
+                    section("Files, tools, and commands", actions),
+                    section("Important results and errors", results),
+                    section("Assistant conclusions and unresolved work", assistant_notes),
+                ]
+            ),
+            12_000,
+        )
         self.history[1:cutoff] = [{"role": "user", "content": summary}]
         self.compaction_count += 1
         boundary = f"Context compacted ({len(older)} history items summarized)."
@@ -543,13 +610,33 @@ class CalebJRSession:
         self.visible_transcript.append(("boundary", boundary))
         self.updated_at = timestamp()
 
+    def _persisted_output(self, path: Path, text: str, artifacts: set[Path]) -> str:
+        if len(text) <= self.MAX_PERSISTED_TRANSCRIPT_ITEM:
+            return text
+        preview = bounded(text, self.MAX_PERSISTED_TRANSCRIPT_ITEM)
+        if len(artifacts) >= self.MAX_PERSISTED_ARTIFACTS:
+            return f"{preview}\n[Full output omitted: session artifact limit reached]"
+        artifact, digest = save_artifact(path, text)
+        artifacts.add(artifact)
+        reference = artifact.relative_to(path.parent)
+        return f"{preview}\n[Full redacted output: {reference}; sha256={digest}]"
+
     def save(self, name: str | None = None) -> Path:
         self.updated_at = timestamp()
         path = session_path(name or self.session_id)
+        artifacts: set[Path] = set()
         transcript = [
-            [role, bounded(text, self.MAX_PERSISTED_TRANSCRIPT_ITEM)]
+            [role, self._persisted_output(path, text, artifacts)]
             for role, text in self.visible_transcript
         ]
+        history = cast(list[Any], json_value(self.history))
+        persisted_history: list[Any] = []
+        for raw_item in history:
+            item = _mapping(raw_item)
+            if item.get("type") == "function_call_output" and isinstance(item.get("output"), str):
+                item = dict(item)
+                item["output"] = self._persisted_output(path, str(item["output"]), artifacts)
+            persisted_history.append(item if item else raw_item)
         envelope = {
             "version": SCHEMA_VERSION,
             "session_id": self.session_id,
@@ -557,7 +644,7 @@ class CalebJRSession:
             "updated_at": self.updated_at,
             "model": self.model,
             "cwd": str(self.cwd),
-            "history": json_value(self.history),
+            "history": persisted_history,
             "transcript": transcript,
             "events": self.event_log[-self.MAX_PERSISTED_EVENTS :],
             "boundaries": self.boundaries,
@@ -568,8 +655,17 @@ class CalebJRSession:
                 "compactions": self.compaction_count,
             },
             "goal": self._goal,
+            "usage": self.usage.to_list(),
         }
-        return save_envelope(path, envelope)
+        saved = save_envelope(path, envelope)
+        artifact_directory = path.with_suffix(".artifacts")
+        if artifact_directory.is_dir():
+            for candidate in artifact_directory.glob("*.txt"):
+                if candidate not in artifacts:
+                    candidate.unlink(missing_ok=True)
+            if not any(artifact_directory.iterdir()):
+                artifact_directory.rmdir()
+        return saved
 
     @classmethod
     def resume(
@@ -584,8 +680,17 @@ class CalebJRSession:
         max_tool_failures: int = MAX_TOOL_FAILURES,
         max_repeated_calls: int = MAX_REPEATED_CALLS,
         client: AsyncOpenAI | None = None,
+        confirm_destructive: Callable[[str], Awaitable[bool]] | None = None,
+        confine_filesystem: bool = True,
+        allow_external: bool = False,
     ) -> "CalebJRSession":
-        _, data = load_envelope(identifier)
+        requested_path = session_path(identifier)
+        if not allow_external and not requested_path.is_relative_to(sessions_dir().resolve()):
+            raise ValueError(
+                "Refusing to load a session outside the CalebJR sessions directory "
+                "without explicit trust."
+            )
+        _, data = load_envelope(requested_path)
         cwd = Path(str(data.get("cwd", ""))).expanduser().resolve()
         if not cwd.is_dir():
             raise ValueError(f"Saved working directory no longer exists: {cwd}")
@@ -610,6 +715,8 @@ class CalebJRSession:
             max_tool_failures=max_tool_failures,
             max_repeated_calls=max_repeated_calls,
             client=client,
+            confirm_destructive=confirm_destructive,
+            confine_filesystem=confine_filesystem,
         )
         session.model = str(data.get("model") or settings.model)
         session.history = history
@@ -634,7 +741,54 @@ class CalebJRSession:
         session.created_at = str(data.get("created_at") or session.created_at)
         session.updated_at = str(data.get("updated_at") or session.updated_at)
         session._goal = str(data["goal"]) if data.get("goal") else None
+        session.usage.records = [
+            UsageRecord.from_dict(item)
+            for raw_item in cast(list[Any], data.get("usage", []))
+            if isinstance(raw_item, dict) and (item := cast(dict[str, Any], raw_item))
+        ]
         return session
+
+    @staticmethod
+    def _money(value: Decimal | None) -> str:
+        return "unavailable" if value is None else f"${value:.4f}"
+
+    def status_summary(self) -> str:
+        main_cost = self.usage.cost(safety=False)
+        safety_cost = self.usage.cost(safety=True)
+        total_cost = self.usage.cost()
+        partial = bool(self.usage.records) and any(
+            not record.cache_write_details_available for record in self.usage.records
+        )
+        cost_note = "; partial, cache-write usage unavailable" if partial else ""
+        mode = "enabled" if self.confirm_destructive is not None else "disabled"
+        confinement = "confined to cwd" if self.confine_filesystem else "unconfined"
+        return (
+            f"Session: {self.user_turn_count} user turns, {self.usage.requests} model requests, "
+            f"{self.tool_call_count} tool calls\n"
+            f"Tokens: {self.usage.input_tokens:,} input · {self.usage.cached_input_tokens:,} "
+            f"cached · {self.usage.output_tokens:,} output "
+            f"({self.usage.reasoning_output_tokens:,} reasoning) · "
+            f"{self.usage.total_tokens:,} total\n"
+            f"Estimated cost: {self._money(total_cost)} "
+            f"(main {self._money(main_cost)}; safety {self._money(safety_cost)}{cost_note})\n"
+            f"Current context: ~{max(1, self.context_characters() // 4):,} tokens\n"
+            f"Model: {self.model}\nWorking directory: {self.cwd}\n"
+            f"Filesystem tools: {confinement}; shell is not sandboxed\n"
+            f"Destructive confirmation: {mode}"
+        )
+
+    def toolbar_summary(self) -> str:
+        cost = self.usage.cost()
+        cost_text = "cost —" if cost is None else f"~${cost:.3f}"
+        return (
+            f" {self.model} | ctx ~{max(1, self.context_characters() // 4):,} | "
+            f"{self.usage.total_tokens:,} tok | {cost_text} | {self.cwd.name} "
+        )
+
+    def raw_context(self) -> str:
+        """Return bounded, redacted canonical context for explicit debugging."""
+        payload = json.dumps(redact_data(json_value(self.history)), ensure_ascii=False, indent=2)
+        return bounded(payload, 100_000)
 
     def context_summary(self) -> str:
         characters = self.context_characters()

@@ -94,6 +94,9 @@ def test_interactive_cli_allows_no_initial_instruction(
         *,
         initial_instruction: str | None = None,
         render_mode: str = "default",
+        resume: str | Path | None = None,
+        confirm_destructive: bool = False,
+        request_timeout: float = 120.0,
     ) -> int:
         seen.append((selected_agent, context, initial_instruction, render_mode))
         return 0
@@ -103,6 +106,45 @@ def test_interactive_cli_allows_no_initial_instruction(
 
     assert cli.main(["calebjr", "--interactive", "--cwd", str(tmp_path)]) == 0
     assert seen == [(agent, RunContext(cwd=tmp_path), None, "default")]
+
+
+def test_continue_shorthand_and_request_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[tuple[str | None, float]] = []
+    agent = CalebJR()
+
+    async def fake_repl(
+        selected_agent: CalebJR,
+        context: RunContext,
+        *,
+        initial_instruction: str | None = None,
+        render_mode: str = "default",
+        resume: str | Path | None = None,
+        confirm_destructive: bool = False,
+        request_timeout: float = 120.0,
+    ) -> int:
+        seen.append((initial_instruction, request_timeout))
+        return 0
+
+    monkeypatch.setattr(cli, "create_agent", lambda name: agent)
+    monkeypatch.setattr(calebjr_repl, "run_repl", fake_repl)
+    assert (
+        cli.main(
+            [
+                "calebjr",
+                "-i",
+                "start here",
+                "--continue",
+                "--request-timeout",
+                "45",
+                "--cwd",
+                str(tmp_path),
+            ]
+        )
+        == 0
+    )
+    assert seen == [("start here", 45.0)]
 
 
 @pytest.mark.parametrize(
@@ -124,6 +166,9 @@ def test_interactive_cli_selects_render_mode(
         *,
         initial_instruction: str | None = None,
         render_mode: str = "default",
+        resume: str | Path | None = None,
+        confirm_destructive: bool = False,
+        request_timeout: float = 120.0,
     ) -> int:
         seen.append(render_mode)
         return 0
@@ -133,6 +178,42 @@ def test_interactive_cli_selects_render_mode(
 
     assert cli.main(["calebjr", "--interactive", flag, "--cwd", str(tmp_path)]) == 0
     assert seen == [expected_mode]
+
+
+def test_interactive_cli_passes_destructive_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[bool] = []
+    agent = CalebJR()
+
+    async def fake_repl(
+        selected_agent: CalebJR,
+        context: RunContext,
+        *,
+        initial_instruction: str | None = None,
+        render_mode: str = "default",
+        resume: str | Path | None = None,
+        confirm_destructive: bool = False,
+        request_timeout: float = 120.0,
+    ) -> int:
+        seen.append(confirm_destructive)
+        return 0
+
+    monkeypatch.setattr(cli, "create_agent", lambda name: agent)
+    monkeypatch.setattr(calebjr_repl, "run_repl", fake_repl)
+    assert (
+        cli.main(
+            [
+                "calebjr",
+                "--interactive",
+                "--confirm-destructive",
+                "--cwd",
+                str(tmp_path),
+            ]
+        )
+        == 0
+    )
+    assert seen == [True]
 
 
 def test_interactive_cli_rejects_noninteractive_agent(

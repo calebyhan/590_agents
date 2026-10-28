@@ -26,6 +26,9 @@ class Arguments(argparse.Namespace):
     compact: bool
     verbose: bool
     resume: str | None
+    confirm_destructive: bool
+    continue_session: bool
+    request_timeout: float | None
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -41,6 +44,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--interactive", action="store_true", help="Start an interactive agent session"
     )
     parser.add_argument("--resume", metavar="ID_OR_PATH", help="Resume a saved interactive session")
+    parser.add_argument(
+        "--continue",
+        dest="continue_session",
+        action="store_true",
+        help="Continue interactively after running -i/--instruction",
+    )
+    parser.add_argument(
+        "--request-timeout",
+        type=float,
+        metavar="SECONDS",
+        help="Interactive model request timeout (default: 120)",
+    )
+    parser.add_argument(
+        "--confirm-destructive",
+        action="store_true",
+        help="Confirm destructive shell commands after independent safety review",
+    )
     detail = parser.add_mutually_exclusive_group()
     detail.add_argument("--quiet", action="store_true", help="Show only answers and errors")
     detail.add_argument("--compact", action="store_true", help="Show condensed interactive events")
@@ -51,11 +71,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if not args.agent:
         parser.error("an agent name is required")
-    if not args.interactive and (not args.instruction or not args.instruction.strip()):
+    interactive = args.interactive or args.continue_session
+    if args.continue_session and (not args.instruction or not args.instruction.strip()):
+        parser.error("--continue requires -i/--instruction")
+    if not interactive and (not args.instruction or not args.instruction.strip()):
         parser.error("-i/--instruction must contain an instruction")
-    if args.resume and not args.interactive:
+    if args.resume and not interactive:
         parser.error("--resume requires --interactive")
-    if not args.interactive and (args.quiet or args.compact or args.verbose):
+    if args.confirm_destructive and not interactive:
+        parser.error("--confirm-destructive requires --interactive")
+    if args.request_timeout is not None and not interactive:
+        parser.error("--request-timeout requires --interactive or --continue")
+    if args.request_timeout is not None and args.request_timeout <= 0:
+        parser.error("--request-timeout must be positive")
+    if not interactive and (args.quiet or args.compact or args.verbose):
         parser.error("--quiet, --compact, and --verbose require --interactive")
     cwd = args.cwd.expanduser().resolve()
     if not cwd.is_dir():
@@ -68,7 +97,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         agent = create_agent(args.agent)
         context = RunContext(cwd=cwd, model=args.model)
-        if args.interactive:
+        if interactive:
             from agents590.calebjr import CalebJR
             from agents590.calebjr.repl import run_repl
 
@@ -81,22 +110,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 render_mode = "compact"
             elif args.verbose:
                 render_mode = "verbose"
-            if args.resume is not None:
-                return asyncio.run(
-                    run_repl(
-                        agent,
-                        context,
-                        initial_instruction=args.instruction,
-                        render_mode=render_mode,
-                        resume=args.resume,
-                    )
-                )
             return asyncio.run(
                 run_repl(
                     agent,
                     context,
                     initial_instruction=args.instruction,
                     render_mode=render_mode,
+                    resume=args.resume,
+                    confirm_destructive=args.confirm_destructive,
+                    request_timeout=args.request_timeout or 120.0,
                 )
             )
         assert args.instruction is not None
