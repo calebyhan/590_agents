@@ -49,6 +49,13 @@ class ModelTextDelta:
 
 
 @dataclass(frozen=True)
+class ReasoningSummary:
+    """Provider-supplied reasoning summary, never a raw internal trace."""
+
+    text: str
+
+
+@dataclass(frozen=True)
 class TurnFinished:
     text: str
 
@@ -66,6 +73,7 @@ type SessionEvent = (
     | SafetyReviewFinished
     | Progress
     | ModelTextDelta
+    | ReasoningSummary
     | TurnFinished
     | TurnFailed
 )

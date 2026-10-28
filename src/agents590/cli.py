@@ -22,6 +22,9 @@ class Arguments(argparse.Namespace):
     env_file: Path | None
     list_agents: bool
     interactive: bool
+    quiet: bool
+    compact: bool
+    verbose: bool
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -36,6 +39,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--interactive", action="store_true", help="Start an interactive agent session"
     )
+    detail = parser.add_mutually_exclusive_group()
+    detail.add_argument("--quiet", action="store_true", help="Show only answers and errors")
+    detail.add_argument("--compact", action="store_true", help="Show condensed interactive events")
+    detail.add_argument("--verbose", action="store_true", help="Show complete interactive events")
     args = parser.parse_args(argv, namespace=Arguments())
     if args.list_agents:
         print("\n".join(agent_names()))
@@ -44,6 +51,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("an agent name is required")
     if not args.interactive and (not args.instruction or not args.instruction.strip()):
         parser.error("-i/--instruction must contain an instruction")
+    if not args.interactive and (args.quiet or args.compact or args.verbose):
+        parser.error("--quiet, --compact, and --verbose require --interactive")
     cwd = args.cwd.expanduser().resolve()
     if not cwd.is_dir():
         parser.error("--cwd must name an existing directory")
@@ -61,7 +70,21 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             if not isinstance(agent, CalebJR):
                 raise ValueError(f"Agent {args.agent!r} does not support interactive sessions.")
-            return asyncio.run(run_repl(agent, context, initial_instruction=args.instruction))
+            render_mode = "default"
+            if args.quiet:
+                render_mode = "quiet"
+            elif args.compact:
+                render_mode = "compact"
+            elif args.verbose:
+                render_mode = "verbose"
+            return asyncio.run(
+                run_repl(
+                    agent,
+                    context,
+                    initial_instruction=args.instruction,
+                    render_mode=render_mode,
+                )
+            )
         assert args.instruction is not None
         output = asyncio.run(agent.run(args.instruction, context))
     except (ValueError, TypeError, NotImplementedError) as error:

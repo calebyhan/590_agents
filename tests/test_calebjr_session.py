@@ -8,8 +8,16 @@ from typing import cast
 from openai import AsyncOpenAI
 
 from agents590.calebjr import CalebJR
-from agents590.calebjr.events import CollectingEventSink, TurnFinished
-from agents590.calebjr.repl import run_repl
+from agents590.calebjr.events import (
+    CollectingEventSink,
+    ModelTextDelta,
+    Progress,
+    ReasoningSummary,
+    ToolFinished,
+    ToolStarted,
+    TurnFinished,
+)
+from agents590.calebjr.repl import PlainRenderer, run_repl
 from agents590.calebjr.session import CalebJRSession
 from agents590.contracts import RunContext
 from agents590.provider import UNCOpenAISettings
@@ -110,6 +118,41 @@ def test_two_turns_retain_model_and_tool_history(tmp_path: Path) -> None:
         "first answer",
         "second answer",
     ]
+
+
+def test_function_call_history_uses_request_fields_only(tmp_path: Path) -> None:
+    response = SimpleNamespace(
+        output=[
+            SimpleNamespace(
+                type="function_call",
+                call_id="call-1",
+                name="cat",
+                arguments='{"path": "note.txt"}',
+                parsed_arguments={"path": "note.txt"},
+            )
+        ],
+        output_text="",
+    )
+    client = FakeClient()
+    client.responses.responses = [response, SimpleNamespace(output=[], output_text="done")]
+    session = CalebJRSession(
+        settings=cast(UNCOpenAISettings, FakeSettings()),
+        context=RunContext(cwd=tmp_path),
+        client=cast(AsyncOpenAI, client),
+    )
+
+    assert asyncio.run(session.run_turn("read the note")).text == "done"
+    function_call = next(
+        item
+        for item in client.responses.inputs[-1]
+        if isinstance(item, dict) and item.get("type") == "function_call"
+    )
+    assert function_call == {
+        "type": "function_call",
+        "call_id": "call-1",
+        "name": "cat",
+        "arguments": '{"path": "note.txt"}',
+    }
 
 
 def test_one_shot_keeps_30_second_timeout(tmp_path: Path) -> None:
@@ -233,3 +276,171 @@ def test_scripted_repl_cancellation_rolls_back_turn_and_continues(tmp_path: Path
     assert "recovered" in output
     assert {"role": "user", "content": "cancel this"} not in responses.inputs[-1]
     assert {"role": "user", "content": "continue"} in responses.inputs[-1]
+
+
+def test_streaming_emits_text_and_provider_reasoning_summary(tmp_path: Path) -> None:
+    final_response = SimpleNamespace(
+        output=[SimpleNamespace(type="message", text="hello")],
+        output_text="hello",
+    )
+
+    class Stream:
+        async def __aenter__(self) -> "Stream":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        def __aiter__(self) -> "Stream":
+            self.events = iter(
+                [
+                    SimpleNamespace(type="response.reasoning_summary_text.delta", delta="Checked."),
+                    SimpleNamespace(type="response.output_text.delta", delta="hel"),
+                    SimpleNamespace(type="response.output_text.delta", delta="lo"),
+                ]
+            )
+            return self
+
+        async def __anext__(self) -> object:
+            try:
+                return next(self.events)
+            except StopIteration:
+                raise StopAsyncIteration from None
+
+        async def get_final_response(self) -> object:
+            return final_response
+
+    class Responses:
+        def stream(self, **kwargs: object) -> Stream:
+            return Stream()
+
+        async def create(self, **kwargs: object) -> object:
+            raise AssertionError("non-streaming fallback should not be used")
+
+    client = FakeClient()
+    client.responses = cast(FakeResponses, Responses())
+    events = CollectingEventSink()
+    session = CalebJRSession(
+        settings=cast(UNCOpenAISettings, FakeSettings()),
+        context=RunContext(cwd=tmp_path),
+        event_sink=events,
+        client=cast(AsyncOpenAI, client),
+    )
+
+    assert asyncio.run(session.run_turn("say hello")).text == "hello"
+    assert [event.text for event in events.events if isinstance(event, ModelTextDelta)] == [
+        "hel",
+        "lo",
+    ]
+    assert [event.text for event in events.events if isinstance(event, ReasoningSummary)] == [
+        "Checked."
+    ]
+
+
+def test_streaming_capability_failure_falls_back(tmp_path: Path) -> None:
+    class UnsupportedStream:
+        async def __aenter__(self) -> "UnsupportedStream":
+            raise NotImplementedError("streaming disabled")
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+    class Responses:
+        def stream(self, **kwargs: object) -> UnsupportedStream:
+            return UnsupportedStream()
+
+        async def create(self, **kwargs: object) -> object:
+            return SimpleNamespace(output=[], output_text="fallback answer")
+
+    client = FakeClient()
+    client.responses = cast(FakeResponses, Responses())
+    events = CollectingEventSink()
+    session = CalebJRSession(
+        settings=cast(UNCOpenAISettings, FakeSettings()),
+        context=RunContext(cwd=tmp_path),
+        event_sink=events,
+        client=cast(AsyncOpenAI, client),
+    )
+
+    assert asyncio.run(session.run_turn("answer")).text == "fallback answer"
+    assert any(
+        isinstance(event, Progress) and "Streaming unavailable" in event.text
+        for event in events.events
+    )
+
+
+def test_nonstreaming_surfaces_only_explicit_reasoning_summaries(tmp_path: Path) -> None:
+    response = SimpleNamespace(
+        output=[
+            SimpleNamespace(
+                type="reasoning",
+                summary=[SimpleNamespace(text="Provider summary.")],
+                content="private reasoning must not be emitted",
+            ),
+            SimpleNamespace(type="message", text="answer"),
+        ],
+        output_text="answer",
+    )
+    client = FakeClient()
+    client.responses.responses = [response]
+    events = CollectingEventSink()
+    session = CalebJRSession(
+        settings=cast(UNCOpenAISettings, FakeSettings()),
+        context=RunContext(cwd=tmp_path),
+        event_sink=events,
+        client=cast(AsyncOpenAI, client),
+    )
+
+    assert asyncio.run(session.run_turn("answer")).text == "answer"
+    assert [event.text for event in events.events if isinstance(event, ReasoningSummary)] == [
+        "Provider summary."
+    ]
+    assert all("private reasoning" not in str(event) for event in events.events)
+
+
+def test_renderer_streams_clean_text_and_honors_modes() -> None:
+    lines: list[str] = []
+    writes: list[str] = []
+    renderer = PlainRenderer(lines.append, write=writes.append, color=False)
+
+    async def render() -> None:
+        await renderer(ModelTextDelta("hel"))
+        await renderer(ModelTextDelta("lo"))
+        await renderer(TurnFinished("hello"))
+        await renderer(ToolFinished("1", "cat", "x" * 2_001, False, 0.1))
+
+    asyncio.run(render())
+    assert writes[:3] == ["hel", "lo", "\n"]
+    assert lines == [f"  {'x' * 2_000}\n… (1 characters omitted)"]
+    assert not any("\033[" in text for text in [*lines, *writes])
+
+    quiet_lines: list[str] = []
+    quiet = PlainRenderer(quiet_lines.append, mode="quiet", color=False)
+
+    async def render_quiet() -> None:
+        await quiet(Progress("working"))
+        await quiet(ToolFinished("1", "cat", "result", False, 0.1))
+        await quiet(TurnFinished("answer"))
+
+    asyncio.run(render_quiet())
+    assert quiet_lines == ["answer"]
+
+    compact_lines: list[str] = []
+    compact = PlainRenderer(compact_lines.append, mode="compact", color=False)
+
+    async def render_compact() -> None:
+        await compact(ToolStarted("1", "cat", {"path": "secret.txt"}))
+        await compact(ToolFinished("1", "cat", "x" * 501, False, 0.1))
+
+    asyncio.run(render_compact())
+    assert compact_lines == ["→ cat", f"  {'x' * 500}\n… (1 characters omitted)"]
+
+    verbose_lines: list[str] = []
+    verbose = PlainRenderer(verbose_lines.append, mode="verbose", color=False)
+    asyncio.run(verbose(ToolFinished("1", "cat", "x" * 2_001, False, 0.1)))
+    assert verbose_lines == [f"  {'x' * 2_001}"]
+
+    colored_lines: list[str] = []
+    colored = PlainRenderer(colored_lines.append, mode="default", color=True)
+    asyncio.run(colored(ReasoningSummary("Explicit provider summary.")))
+    assert colored_lines == ["\033[2mReasoning summary: Explicit provider summary.\033[0m"]

@@ -1,19 +1,17 @@
-"""Minimal plain-text interactive terminal for CalebJR."""
+"""Interactive terminal UI for CalebJR."""
 
 import asyncio
+import os
+import sys
 from collections.abc import Callable
+from pathlib import Path
+
+from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.history import FileHistory
 
 from agents590.calebjr import CalebJR
-from agents590.calebjr.events import (
-    Progress,
-    SafetyReviewFinished,
-    SafetyReviewStarted,
-    SessionEvent,
-    ToolFinished,
-    ToolStarted,
-    TurnFailed,
-    TurnFinished,
-)
+from agents590.calebjr.render import PlainRenderer, RenderMode, terminal_renderer
 from agents590.contracts import RunContext
 
 _HELP = """Commands:
@@ -21,47 +19,62 @@ _HELP = """Commands:
   /context     Show bounded session context statistics.
   /transcript  Show conversation and tool activity.
   /clear       Clear conversation history (retains cwd and model).
-  /exit, /quit Exit the session."""
+  /exit, /quit Exit the session.
+
+Input:
+  Esc+Enter    Submit a multiline prompt.
+  Ctrl-D       Exit from an empty prompt."""
+
+_COMMANDS = ["/help", "/context", "/transcript", "/clear", "/exit", "/quit"]
 
 
-class PlainRenderer:
-    """Render stable text without ANSI escapes."""
-
-    def __init__(self, output: Callable[[str], None] = print) -> None:
-        self.output = output
-
-    async def __call__(self, event: SessionEvent) -> None:
-        if isinstance(event, Progress):
-            self.output(f"● {event.text}")
-        elif isinstance(event, ToolStarted):
-            self.output(f"→ {event.name}: {event.arguments}")
-        elif isinstance(event, ToolFinished):
-            marker = "!" if event.failed else " "
-            self.output(f"{marker} {event.output}")
-        elif isinstance(event, SafetyReviewStarted):
-            self.output(f"? safety review: {event.command}")
-        elif isinstance(event, SafetyReviewFinished):
-            self.output("✓ safety review approved" if event.approved else f"! {event.decision}")
-        elif isinstance(event, TurnFinished):
-            self.output(event.text)
-        elif isinstance(event, TurnFailed) and event.error == "Turn cancelled.":
-            self.output(event.error)
+def _history_file() -> Path:
+    state_home = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+    path = state_home / "agents590" / "calebjr" / "history"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 async def run_repl(
     agent: CalebJR,
     context: RunContext,
     *,
-    input_fn: Callable[[str], str] = input,
+    input_fn: Callable[[str], str] | None = None,
     output_fn: Callable[[str], None] = print,
+    write_fn: Callable[[str], None] | None = None,
     request_timeout: float = 120.0,
     initial_instruction: str | None = None,
+    render_mode: RenderMode = "default",
 ) -> int:
-    """Run a session using injectable plain input/output for deterministic tests."""
-    renderer = PlainRenderer(output_fn)
+    """Run one stateful session; injectable I/O keeps tests deterministic."""
+    interactive_terminal = input_fn is None and output_fn is print and write_fn is None
+    if write_fn is None:
+        if output_fn is print:
+
+            def terminal_write(text: str) -> None:
+                sys.stdout.write(text)
+                sys.stdout.flush()
+
+            write_fn = terminal_write
+        else:
+            write_fn = output_fn
+    renderer = (
+        terminal_renderer(mode=render_mode)
+        if interactive_terminal
+        else PlainRenderer(output_fn, write=write_fn, mode=render_mode)
+    )
     session = agent.create_session(context, request_timeout=request_timeout)
-    # Keep session creation centralized on the agent, but install the terminal sink here.
     session.event_sink = renderer
+    prompt_session: PromptSession[str] | None = None
+    if input_fn is None:
+        toolbar = f" {session.settings.model}  |  {context.cwd}  |  {render_mode} "
+        prompt_session = PromptSession(
+            history=FileHistory(str(_history_file())),
+            completer=WordCompleter(_COMMANDS, sentence=True),
+            complete_while_typing=True,
+            bottom_toolbar=toolbar,
+        )
+
     output_fn(f"CalebJR · {context.cwd.name} · {session.settings.model}")
     output_fn("Type /help for commands.")
     try:
@@ -69,7 +82,11 @@ async def run_repl(
             await session.run_turn(initial_instruction)
         while True:
             try:
-                line = input_fn("> ")
+                if prompt_session is not None:
+                    line = await prompt_session.prompt_async("> ", multiline=True)
+                else:
+                    assert input_fn is not None
+                    line = input_fn("> ")
             except EOFError:
                 break
             except KeyboardInterrupt:
@@ -105,7 +122,6 @@ async def run_repl(
             try:
                 await session.run_turn(instruction)
             except (KeyboardInterrupt, asyncio.CancelledError):
-                # The session rolls back and emits the cancellation before re-raising.
                 continue
     finally:
         await session.close()

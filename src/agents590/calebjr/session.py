@@ -8,7 +8,7 @@ import time
 from contextlib import chdir
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 from openai import AsyncOpenAI
 
@@ -16,6 +16,7 @@ from agents590.calebjr.events import (
     EventCallback,
     ModelTextDelta,
     Progress,
+    ReasoningSummary,
     SafetyReviewFinished,
     SafetyReviewStarted,
     SessionEvent,
@@ -59,6 +60,12 @@ RISKY_SHELL_PATTERNS = (
 @dataclass(frozen=True)
 class TurnResult:
     text: str
+
+
+class _FunctionCall(Protocol):
+    call_id: str
+    name: str
+    arguments: str
 
 
 class CalebJRSession:
@@ -190,9 +197,75 @@ class CalebJRSession:
     async def _finish(self, text: str) -> TurnResult:
         self.assistant_turn_count += 1
         self.visible_transcript.append(("assistant", text))
-        await self._emit(ModelTextDelta(text))
         await self._emit(TurnFinished(text))
         return TurnResult(text)
+
+    @staticmethod
+    def _response_arguments(history: list[Any], model: str) -> dict[str, Any]:
+        return {
+            "model": model,
+            "input": history,
+            "tools": CalebJRSession.make_tool_schemas(),
+            "tool_choice": "auto",
+            "parallel_tool_calls": False,
+            "store": False,
+            "background": False,
+        }
+
+    @staticmethod
+    def _history_item(item: object) -> object:
+        if getattr(item, "type", None) != "function_call":
+            return item
+        call = cast(_FunctionCall, item)
+        return {
+            "type": "function_call",
+            "call_id": call.call_id,
+            "name": call.name,
+            "arguments": call.arguments,
+        }
+
+    async def _emit_response_reasoning(self, response: object) -> None:
+        """Emit only provider-labelled summaries, never opaque reasoning content."""
+        for item in getattr(response, "output", []):
+            if getattr(item, "type", None) != "reasoning":
+                continue
+            for part in getattr(item, "summary", []) or []:
+                text = getattr(part, "text", "")
+                if text:
+                    await self._emit(ReasoningSummary(text))
+
+    async def _request_model(self) -> tuple[Any, bool]:
+        """Prefer Responses streaming and fall back when the gateway cannot stream."""
+        arguments = self._response_arguments(self.history, self.settings.model)
+        stream_method = getattr(self.client.responses, "stream", None)
+        if stream_method is None:
+            response = cast(Any, await self.client.responses.create(**arguments))
+            return response, False
+
+        received_delta = False
+        reasoning_parts: list[str] = []
+        try:
+            async with stream_method(**arguments) as stream:
+                async for event in stream:
+                    event_type = getattr(event, "type", "")
+                    delta = getattr(event, "delta", "")
+                    if event_type == "response.output_text.delta" and delta:
+                        received_delta = True
+                        await self._emit(ModelTextDelta(delta))
+                    elif event_type == "response.reasoning_summary_text.delta" and delta:
+                        received_delta = True
+                        reasoning_parts.append(delta)
+                if reasoning_parts:
+                    await self._emit(ReasoningSummary("".join(reasoning_parts)))
+                return await stream.get_final_response(), bool(reasoning_parts)
+        except Exception as error:
+            if received_delta:
+                raise
+            await self._emit(
+                Progress(f"Streaming unavailable; using non-streaming mode ({error}).")
+            )
+            response = cast(Any, await self.client.responses.create(**arguments))
+            return response, False
 
     async def run_turn(self, instruction: str) -> TurnResult:
         """Run one turn, retaining complete response/tool history for the next turn."""
@@ -214,20 +287,14 @@ class CalebJRSession:
         try:
             for _ in range(self.MAX_STEPS):
                 try:
-                    response = await self.client.responses.create(
-                        model=self.settings.model,
-                        input=self.history,
-                        tools=self.make_tool_schemas(),
-                        tool_choice="auto",
-                        parallel_tool_calls=False,
-                        store=False,
-                        background=False,
-                    )
+                    response, streamed_reasoning = await self._request_model()
                 except Exception as error:
                     text = f"Model request failed: {error}"
                     await self._emit(TurnFailed(text))
                     return await self._finish(text)
-                self.history.extend(response.output)
+                if not streamed_reasoning:
+                    await self._emit_response_reasoning(response)
+                self.history.extend(self._history_item(item) for item in response.output)
                 calls = [item for item in response.output if item.type == "function_call"]
                 if not calls:
                     answer = (response.output_text or "").strip()

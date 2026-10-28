@@ -85,7 +85,7 @@ def test_cli_passes_instruction_workdir_and_model_to_the_selected_agent(
 def test_interactive_cli_allows_no_initial_instruction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    seen: list[tuple[CalebJR, RunContext, str | None]] = []
+    seen: list[tuple[CalebJR, RunContext, str | None, str]] = []
     agent = CalebJR()
 
     async def fake_repl(
@@ -93,15 +93,46 @@ def test_interactive_cli_allows_no_initial_instruction(
         context: RunContext,
         *,
         initial_instruction: str | None = None,
+        render_mode: str = "default",
     ) -> int:
-        seen.append((selected_agent, context, initial_instruction))
+        seen.append((selected_agent, context, initial_instruction, render_mode))
         return 0
 
     monkeypatch.setattr(cli, "create_agent", lambda name: agent)
     monkeypatch.setattr(calebjr_repl, "run_repl", fake_repl)
 
     assert cli.main(["calebjr", "--interactive", "--cwd", str(tmp_path)]) == 0
-    assert seen == [(agent, RunContext(cwd=tmp_path), None)]
+    assert seen == [(agent, RunContext(cwd=tmp_path), None, "default")]
+
+
+@pytest.mark.parametrize(
+    ("flag", "expected_mode"),
+    [("--quiet", "quiet"), ("--compact", "compact"), ("--verbose", "verbose")],
+)
+def test_interactive_cli_selects_render_mode(
+    flag: str,
+    expected_mode: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = CalebJR()
+    seen: list[str] = []
+
+    async def fake_repl(
+        selected_agent: CalebJR,
+        context: RunContext,
+        *,
+        initial_instruction: str | None = None,
+        render_mode: str = "default",
+    ) -> int:
+        seen.append(render_mode)
+        return 0
+
+    monkeypatch.setattr(cli, "create_agent", lambda name: agent)
+    monkeypatch.setattr(calebjr_repl, "run_repl", fake_repl)
+
+    assert cli.main(["calebjr", "--interactive", flag, "--cwd", str(tmp_path)]) == 0
+    assert seen == [expected_mode]
 
 
 def test_interactive_cli_rejects_noninteractive_agent(
