@@ -15,6 +15,7 @@ from rich.syntax import Syntax
 from rich.text import Text
 
 from agents590.calebjr.events import (
+    ContextCompacted,
     ModelTextDelta,
     Progress,
     ReasoningSummary,
@@ -86,6 +87,12 @@ class PlainRenderer:
         elif isinstance(event, ReasoningSummary):
             if self.mode != "quiet":
                 self.line(self._styled(f"Reasoning summary: {event.text}", "2"))
+        elif isinstance(event, ContextCompacted):
+            if self.mode != "quiet":
+                self.line(
+                    f"Context compacted: {event.summarized_items} items; "
+                    f"{event.characters_before:,} → {event.characters_after:,} characters."
+                )
         elif isinstance(event, ToolStarted):
             self._close_stream_line()
             self._response_text = ""
@@ -199,6 +206,15 @@ class RichRenderer:
         elif isinstance(event, ReasoningSummary):
             if self.mode != "quiet":
                 self._print(Panel(event.text, title="Reasoning summary", style="dim", expand=False))
+        elif isinstance(event, ContextCompacted):
+            if self.mode != "quiet":
+                self._print(
+                    Text(
+                        f"Context compacted: {event.summarized_items} items; "
+                        f"{event.characters_before:,} → {event.characters_after:,} characters.",
+                        style="yellow",
+                    )
+                )
         elif isinstance(event, ToolStarted):
             self._stop_status()
             self._stop_live()

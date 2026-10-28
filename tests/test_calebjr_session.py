@@ -17,7 +17,14 @@ from agents590.calebjr.events import (
     ToolStarted,
     TurnFinished,
 )
-from agents590.calebjr.repl import PlainRenderer, run_repl
+from agents590.calebjr.repl import (
+    INTERACTIVE_MAX_INVALID_RESPONSES,
+    INTERACTIVE_MAX_REPEATED_CALLS,
+    INTERACTIVE_MAX_STEPS,
+    INTERACTIVE_MAX_TOOL_FAILURES,
+    PlainRenderer,
+    run_repl,
+)
 from agents590.calebjr.session import CalebJRSession
 from agents590.contracts import RunContext
 from agents590.provider import UNCOpenAISettings
@@ -82,9 +89,31 @@ class ClientCreatingSettings:
 class FakeAgent(CalebJR):
     def __init__(self, settings: ClientCreatingSettings) -> None:
         self.settings = settings
+        self.sessions: list[CalebJRSession] = []
 
     def provider_settings(self, context: RunContext) -> UNCOpenAISettings:
         return cast(UNCOpenAISettings, self.settings)
+
+    def create_session(
+        self,
+        context: RunContext,
+        *,
+        request_timeout: float = 30.0,
+        max_steps: int = CalebJRSession.MAX_STEPS,
+        max_invalid_responses: int = CalebJRSession.MAX_INVALID,
+        max_tool_failures: int = CalebJRSession.MAX_TOOL_FAILURES,
+        max_repeated_calls: int = CalebJRSession.MAX_REPEATED_CALLS,
+    ) -> CalebJRSession:
+        session = super().create_session(
+            context,
+            request_timeout=request_timeout,
+            max_steps=max_steps,
+            max_invalid_responses=max_invalid_responses,
+            max_tool_failures=max_tool_failures,
+            max_repeated_calls=max_repeated_calls,
+        )
+        self.sessions.append(session)
+        return session
 
 
 def test_two_turns_retain_model_and_tool_history(tmp_path: Path) -> None:
@@ -165,6 +194,8 @@ def test_one_shot_keeps_30_second_timeout(tmp_path: Path) -> None:
     assert result == "first answer"
     assert settings.timeouts == [30.0]
     assert settings.client.closed
+    assert agent.sessions[0].max_steps == CalebJRSession.MAX_STEPS
+    assert agent.sessions[0].max_invalid_responses == CalebJRSession.MAX_INVALID
 
 
 def test_scripted_repl_reuses_session_and_selects_120_second_timeout(tmp_path: Path) -> None:
@@ -186,6 +217,10 @@ def test_scripted_repl_reuses_session_and_selects_120_second_timeout(tmp_path: P
     assert result == 0
     assert settings.timeouts == [120.0]
     assert settings.client.closed
+    assert agent.sessions[0].max_steps == INTERACTIVE_MAX_STEPS
+    assert agent.sessions[0].max_invalid_responses == INTERACTIVE_MAX_INVALID_RESPONSES
+    assert agent.sessions[0].max_tool_failures == INTERACTIVE_MAX_TOOL_FAILURES
+    assert agent.sessions[0].max_repeated_calls == INTERACTIVE_MAX_REPEATED_CALLS
     assert "● Processing request." in output
     assert "first answer" in output
     assert "second answer" in output

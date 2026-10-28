@@ -5,14 +5,17 @@ import json
 import os
 import re
 import time
+import uuid
 from contextlib import chdir
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, cast
 
 from openai import AsyncOpenAI
 
 from agents590.calebjr.events import (
+    ContextCompacted,
     EventCallback,
     ModelTextDelta,
     Progress,
@@ -27,7 +30,16 @@ from agents590.calebjr.events import (
     TurnStarted,
     discard_event,
 )
+from agents590.calebjr.redaction import bounded
 from agents590.calebjr.tools import Tools
+from agents590.calebjr.transcript import (
+    SCHEMA_VERSION,
+    json_value,
+    load_envelope,
+    save_envelope,
+    session_path,
+    timestamp,
+)
 from agents590.contracts import RunContext
 from agents590.provider import UNCOpenAISettings
 
@@ -68,11 +80,22 @@ class _FunctionCall(Protocol):
     arguments: str
 
 
+def _mapping(value: object) -> dict[str, Any]:
+    return cast(dict[str, Any], value) if isinstance(value, dict) else {}
+
+
 class CalebJRSession:
     """Own a provider client and canonical history across multiple user turns."""
 
+    # Compatibility defaults used by one-shot/evaluation callers.
     MAX_STEPS = 50
-    MAX_INVALID = 5
+    MAX_INVALID = 10
+    MAX_TOOL_FAILURES = 10
+    MAX_REPEATED_CALLS = 10
+    DEFAULT_CONTEXT_BUDGET = 120_000
+    MAX_TOOL_OUTPUT = 100_000
+    MAX_PERSISTED_TRANSCRIPT_ITEM = 20_000
+    MAX_PERSISTED_EVENTS = 2_000
 
     def __init__(
         self,
@@ -81,17 +104,42 @@ class CalebJRSession:
         context: RunContext,
         event_sink: EventCallback = discard_event,
         request_timeout: float = 30.0,
+        max_steps: int = MAX_STEPS,
+        max_invalid_responses: int = MAX_INVALID,
+        max_tool_failures: int = MAX_TOOL_FAILURES,
+        max_repeated_calls: int = MAX_REPEATED_CALLS,
         client: AsyncOpenAI | None = None,
     ) -> None:
         self.settings = settings
         self.context = context
         self.event_sink = event_sink
+        limits = {
+            "max_steps": max_steps,
+            "max_invalid_responses": max_invalid_responses,
+            "max_tool_failures": max_tool_failures,
+            "max_repeated_calls": max_repeated_calls,
+        }
+        if any(value < 1 for value in limits.values()):
+            raise ValueError("Session loop limits must be positive integers.")
         self.request_timeout = request_timeout
+        self.max_steps = max_steps
+        self.max_invalid_responses = max_invalid_responses
+        self.max_tool_failures = max_tool_failures
+        self.max_repeated_calls = max_repeated_calls
         self.client = client or settings.create_async_client(timeout=request_timeout)
         self._owns_client = client is None
+        self.model = settings.model
+        self.cwd = context.cwd
+        self.session_id = str(uuid.uuid4())
+        self.created_at = datetime.now(UTC).isoformat()
+        self.updated_at = self.created_at
+        self.compaction_count = 0
+        self.context_budget = self.DEFAULT_CONTEXT_BUDGET
         system_prompt = Path(__file__).with_name("SYSTEM_PROMPT.md").read_text(encoding="utf-8")
         self.history: list[Any] = [{"role": "system", "content": system_prompt}]
         self.visible_transcript: list[tuple[str, str]] = []
+        self.event_log: list[dict[str, Any]] = []
+        self.boundaries: list[str] = []
         self.user_turn_count: int = 0
         self.assistant_turn_count: int = 0
         self.tool_call_count: int = 0
@@ -148,6 +196,10 @@ class CalebJRSession:
         )
 
     async def _emit(self, event: SessionEvent) -> None:
+        fields = vars(event)
+        self.event_log.append({"type": type(event).__name__, **json_value(fields)})
+        if len(self.event_log) > self.MAX_PERSISTED_EVENTS:
+            del self.event_log[: -self.MAX_PERSISTED_EVENTS]
         await self.event_sink(event)
 
     async def safety_review(self, instruction: str, command: str) -> str:
@@ -195,6 +247,7 @@ class CalebJRSession:
         return result
 
     async def _finish(self, text: str) -> TurnResult:
+        self.updated_at = timestamp()
         self.assistant_turn_count += 1
         self.visible_transcript.append(("assistant", text))
         await self._emit(TurnFinished(text))
@@ -236,7 +289,7 @@ class CalebJRSession:
 
     async def _request_model(self) -> tuple[Any, bool]:
         """Prefer Responses streaming and fall back when the gateway cannot stream."""
-        arguments = self._response_arguments(self.history, self.settings.model)
+        arguments = self._response_arguments(self.history, self.model)
         stream_method = getattr(self.client.responses, "stream", None)
         if stream_method is None:
             response = cast(Any, await self.client.responses.create(**arguments))
@@ -271,6 +324,8 @@ class CalebJRSession:
         """Run one turn, retaining complete response/tool history for the next turn."""
         if not instruction.strip():
             raise ValueError("instruction must not be blank")
+        if self.context_characters() > self.context_budget:
+            await self.compact()
         checkpoint = len(self.history)
         transcript_checkpoint = len(self.visible_transcript)
         counters = (self.user_turn_count, self.assistant_turn_count, self.tool_call_count)
@@ -283,9 +338,10 @@ class CalebJRSession:
         await self._emit(Progress("Processing request."))
         last_call: tuple[str, str] | None = None
         repeated_call_count = 0
-        invalid_count = 0
+        invalid_response_count = 0
+        tool_failure_count = 0
         try:
-            for _ in range(self.MAX_STEPS):
+            for _ in range(self.max_steps):
                 try:
                     response, streamed_reasoning = await self._request_model()
                 except Exception as error:
@@ -300,10 +356,11 @@ class CalebJRSession:
                     answer = (response.output_text or "").strip()
                     tool_names = "|".join(re.escape(name) for name in TOOL_ARGS)
                     if re.search(rf"\[({tool_names})\]\(", answer):
-                        invalid_count += 1
-                        if invalid_count > self.MAX_INVALID:
+                        invalid_response_count += 1
+                        if invalid_response_count > self.max_invalid_responses:
                             return await self._finish(
-                                "Unable to complete: invalid response retry limit reached."
+                                "Turn stopped after reaching the invalid-response limit. "
+                                "The session is intact; ask me to continue."
                             )
                         self.history.append(
                             {
@@ -319,7 +376,7 @@ class CalebJRSession:
                         answer.removeprefix("FINAL:").strip() or "No answer generated."
                     )
                 if len(calls) != 1:
-                    invalid_count += 1
+                    invalid_response_count += 1
                     error = "Invalid response: make exactly one tool call at a time."
                     for call in calls:
                         self.history.append(
@@ -329,18 +386,20 @@ class CalebJRSession:
                                 "output": error,
                             }
                         )
-                    if invalid_count > self.MAX_INVALID:
+                    if invalid_response_count > self.max_invalid_responses:
                         return await self._finish(
-                            "Unable to complete: invalid response retry limit reached."
+                            "Turn stopped after reaching the invalid-response limit. "
+                            "The session is intact; ask me to continue."
                         )
                     continue
                 call = calls[0]
                 current_call = (call.name, call.arguments)
                 if current_call == last_call:
                     repeated_call_count += 1
-                    if repeated_call_count > self.MAX_INVALID:
+                    if repeated_call_count > self.max_repeated_calls:
                         return await self._finish(
-                            "Unable to complete: repeated tool call retry limit reached."
+                            "Turn stopped after reaching the repeated-call limit. "
+                            "The session is intact; ask me to continue."
                         )
                 else:
                     repeated_call_count = 0
@@ -364,18 +423,18 @@ class CalebJRSession:
                         if self.requires_safety_review(command):
                             review = await self.safety_review(instruction, command)
                             result = (
-                                Tools.shell(command, cwd=str(self.context.cwd))
+                                Tools.shell(command, cwd=str(self.cwd))
                                 if review == "APPROVE"
                                 else review
                             )
                         else:
-                            result = Tools.shell(command, cwd=str(self.context.cwd))
+                            result = Tools.shell(command, cwd=str(self.cwd))
                     else:
-                        with chdir(self.context.cwd):
+                        with chdir(self.cwd):
                             result = getattr(Tools, call.name)(**args)
                 except Exception as error:
                     result = f"Tool error: {error}"
-                output = str(result)
+                output = bounded(str(result), self.MAX_TOOL_OUTPUT)
                 await self._emit(
                     ToolFinished(
                         call.call_id,
@@ -390,12 +449,16 @@ class CalebJRSession:
                     {"type": "function_call_output", "call_id": call.call_id, "output": output}
                 )
                 if self.tool_failed(output):
-                    invalid_count += 1
-                    if invalid_count > self.MAX_INVALID:
+                    tool_failure_count += 1
+                    if tool_failure_count > self.max_tool_failures:
                         return await self._finish(
-                            "Unable to complete: tool failure retry limit reached."
+                            "Turn stopped after reaching the tool-failure limit. "
+                            "The session is intact; ask me to continue."
                         )
-            return await self._finish("Unable to complete: maximum steps reached.")
+            return await self._finish(
+                "Turn stopped after reaching the step limit. "
+                "The session is intact; ask me to continue."
+            )
         except (asyncio.CancelledError, KeyboardInterrupt):
             del self.history[checkpoint:]
             del self.visible_transcript[transcript_checkpoint:]
@@ -408,13 +471,182 @@ class CalebJRSession:
     def clear(self) -> None:
         del self.history[1:]
         self.visible_transcript.clear()
+        self.event_log.clear()
+        self.boundaries.clear()
         self.user_turn_count = self.assistant_turn_count = self.tool_call_count = 0
+        self.compaction_count = 0
         self._goal = None
 
+    def context_characters(self) -> int:
+        return sum(len(str(json_value(item))) for item in self.history)
+
+    async def compact(self, *, keep_recent_turns: int = 2) -> bool:
+        """Replace completed older turns with a bounded, explicit local summary."""
+        characters_before = self.context_characters()
+        user_indexes = [
+            index for index, item in enumerate(self.history) if _mapping(item).get("role") == "user"
+        ]
+        if len(user_indexes) <= keep_recent_turns:
+            return False
+        cutoff = user_indexes[-keep_recent_turns]
+        older = self.history[1:cutoff]
+        canonical = [_mapping(json_value(item)) for item in older]
+        calls = {
+            str(item.get("call_id")) for item in canonical if item.get("type") == "function_call"
+        }
+        outputs = {
+            str(item.get("call_id"))
+            for item in canonical
+            if item.get("type") == "function_call_output"
+        }
+        if calls != outputs:
+            return False
+        visible_cutoff = max(0, len(self.visible_transcript) - keep_recent_turns * 3)
+        summary_lines = [
+            f"- {role}: {bounded(text, 1_000)}"
+            for role, text in self.visible_transcript[:visible_cutoff]
+        ]
+        if not summary_lines:
+            summary_lines = [f"- {bounded(str(json_value(item)), 1_000)}" for item in older]
+        summary = "[Context compaction summary]\n" + bounded("\n".join(summary_lines), 12_000)
+        self.history[1:cutoff] = [{"role": "user", "content": summary}]
+        self.compaction_count += 1
+        boundary = f"Context compacted ({len(older)} history items summarized)."
+        self.boundaries.append(boundary)
+        self.visible_transcript.append(("boundary", boundary))
+        self.updated_at = timestamp()
+        await self._emit(ContextCompacted(len(older), characters_before, self.context_characters()))
+        return True
+
+    def set_model(self, model: str) -> None:
+        from agents590.provider import deployment_name
+
+        selected = deployment_name(model)
+        if selected == self.model:
+            return
+        boundary = f"Model changed: {self.model} → {selected}"
+        self.model = selected
+        self.boundaries.append(boundary)
+        self.visible_transcript.append(("boundary", boundary))
+        self.updated_at = timestamp()
+
+    def set_cwd(self, cwd: Path) -> None:
+        selected = cwd.expanduser().resolve()
+        if not selected.is_dir():
+            raise ValueError("Working directory must be an existing directory.")
+        if selected == self.cwd:
+            return
+        boundary = f"Working directory changed: {self.cwd} → {selected}"
+        self.cwd = selected
+        self.context = RunContext(cwd=selected, model=self.model)
+        self.boundaries.append(boundary)
+        self.visible_transcript.append(("boundary", boundary))
+        self.updated_at = timestamp()
+
+    def save(self, name: str | None = None) -> Path:
+        self.updated_at = timestamp()
+        path = session_path(name or self.session_id)
+        transcript = [
+            [role, bounded(text, self.MAX_PERSISTED_TRANSCRIPT_ITEM)]
+            for role, text in self.visible_transcript
+        ]
+        envelope = {
+            "version": SCHEMA_VERSION,
+            "session_id": self.session_id,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "model": self.model,
+            "cwd": str(self.cwd),
+            "history": json_value(self.history),
+            "transcript": transcript,
+            "events": self.event_log[-self.MAX_PERSISTED_EVENTS :],
+            "boundaries": self.boundaries,
+            "counts": {
+                "user": self.user_turn_count,
+                "assistant": self.assistant_turn_count,
+                "tools": self.tool_call_count,
+                "compactions": self.compaction_count,
+            },
+            "goal": self._goal,
+        }
+        return save_envelope(path, envelope)
+
+    @classmethod
+    def resume(
+        cls,
+        identifier: str | Path,
+        *,
+        settings: UNCOpenAISettings,
+        event_sink: EventCallback = discard_event,
+        request_timeout: float = 120.0,
+        max_steps: int = MAX_STEPS,
+        max_invalid_responses: int = MAX_INVALID,
+        max_tool_failures: int = MAX_TOOL_FAILURES,
+        max_repeated_calls: int = MAX_REPEATED_CALLS,
+        client: AsyncOpenAI | None = None,
+    ) -> "CalebJRSession":
+        _, data = load_envelope(identifier)
+        cwd = Path(str(data.get("cwd", ""))).expanduser().resolve()
+        if not cwd.is_dir():
+            raise ValueError(f"Saved working directory no longer exists: {cwd}")
+        history = cast(list[Any], data["history"])
+        # Pending calls are data only and are rejected before a client is created.
+        pending: set[str] = set()
+        for raw_item in history:
+            item = _mapping(raw_item)
+            if item.get("type") == "function_call":
+                pending.add(str(item.get("call_id")))
+            elif item.get("type") == "function_call_output":
+                pending.discard(str(item.get("call_id")))
+        if pending:
+            raise ValueError("Saved session contains an unmatched pending tool call.")
+        session = cls(
+            settings=settings,
+            context=RunContext(cwd=cwd, model=str(data.get("model") or settings.model)),
+            event_sink=event_sink,
+            request_timeout=request_timeout,
+            max_steps=max_steps,
+            max_invalid_responses=max_invalid_responses,
+            max_tool_failures=max_tool_failures,
+            max_repeated_calls=max_repeated_calls,
+            client=client,
+        )
+        session.model = str(data.get("model") or settings.model)
+        session.history = history
+        transcript = cast(list[Any], data["transcript"])
+        session.visible_transcript = [
+            (str(item[0]), str(item[1]))
+            for raw_item in transcript
+            if isinstance(raw_item, list) and len(item := cast(list[Any], raw_item)) == 2
+        ]
+        session.event_log = [
+            mapping
+            for item in cast(list[Any], data.get("events", []))
+            if (mapping := _mapping(item))
+        ][-session.MAX_PERSISTED_EVENTS :]
+        counts = _mapping(data.get("counts", {}))
+        session.user_turn_count = int(counts.get("user", 0))
+        session.assistant_turn_count = int(counts.get("assistant", 0))
+        session.tool_call_count = int(counts.get("tools", 0))
+        session.compaction_count = int(counts.get("compactions", 0))
+        session.boundaries = [str(item) for item in data.get("boundaries", [])]
+        session.session_id = str(data.get("session_id") or session.session_id)
+        session.created_at = str(data.get("created_at") or session.created_at)
+        session.updated_at = str(data.get("updated_at") or session.updated_at)
+        session._goal = str(data["goal"]) if data.get("goal") else None
+        return session
+
     def context_summary(self) -> str:
-        characters = sum(len(str(item)) for item in self.history)
+        characters = self.context_characters()
+        largest = sorted(
+            (len(text), role) for role, text in self.visible_transcript if role == "tool"
+        )[-3:]
+        largest_text = ", ".join(f"{size:,} chars" for size, _ in reversed(largest)) or "none"
         return (
             f"Session: {self.user_turn_count} user turns, {self.tool_call_count} tool events\n"
             f"Estimated input: {max(1, characters // 4):,} tokens ({characters:,} characters)\n"
-            f"Working directory: {self.context.cwd}\nModel: {self.settings.model}"
+            f"Context budget: {self.context_budget:,} characters; "
+            f"compactions: {self.compaction_count}\n"
+            f"Largest tool outputs: {largest_text}\n"
+            f"Working directory: {self.cwd}\nModel: {self.model}"
         )

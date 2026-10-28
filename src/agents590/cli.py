@@ -25,6 +25,7 @@ class Arguments(argparse.Namespace):
     quiet: bool
     compact: bool
     verbose: bool
+    resume: str | None
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -39,6 +40,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--interactive", action="store_true", help="Start an interactive agent session"
     )
+    parser.add_argument("--resume", metavar="ID_OR_PATH", help="Resume a saved interactive session")
     detail = parser.add_mutually_exclusive_group()
     detail.add_argument("--quiet", action="store_true", help="Show only answers and errors")
     detail.add_argument("--compact", action="store_true", help="Show condensed interactive events")
@@ -51,6 +53,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("an agent name is required")
     if not args.interactive and (not args.instruction or not args.instruction.strip()):
         parser.error("-i/--instruction must contain an instruction")
+    if args.resume and not args.interactive:
+        parser.error("--resume requires --interactive")
     if not args.interactive and (args.quiet or args.compact or args.verbose):
         parser.error("--quiet, --compact, and --verbose require --interactive")
     cwd = args.cwd.expanduser().resolve()
@@ -77,6 +81,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 render_mode = "compact"
             elif args.verbose:
                 render_mode = "verbose"
+            if args.resume is not None:
+                return asyncio.run(
+                    run_repl(
+                        agent,
+                        context,
+                        initial_instruction=args.instruction,
+                        render_mode=render_mode,
+                        resume=args.resume,
+                    )
+                )
             return asyncio.run(
                 run_repl(
                     agent,

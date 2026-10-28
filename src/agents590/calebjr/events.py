@@ -44,6 +44,13 @@ class Progress:
 
 
 @dataclass(frozen=True)
+class ContextCompacted:
+    summarized_items: int
+    characters_before: int
+    characters_after: int
+
+
+@dataclass(frozen=True)
 class ModelTextDelta:
     text: str
 
@@ -72,6 +79,7 @@ type SessionEvent = (
     | SafetyReviewStarted
     | SafetyReviewFinished
     | Progress
+    | ContextCompacted
     | ModelTextDelta
     | ReasoningSummary
     | TurnFinished

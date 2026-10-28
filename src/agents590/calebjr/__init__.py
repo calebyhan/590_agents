@@ -23,13 +23,24 @@ class CalebJR:
         return UNCOpenAISettings.from_env(model=context.model)
 
     def create_session(
-        self, context: RunContext, *, request_timeout: float = 30.0
+        self,
+        context: RunContext,
+        *,
+        request_timeout: float = 30.0,
+        max_steps: int = CalebJRSession.MAX_STEPS,
+        max_invalid_responses: int = CalebJRSession.MAX_INVALID,
+        max_tool_failures: int = CalebJRSession.MAX_TOOL_FAILURES,
+        max_repeated_calls: int = CalebJRSession.MAX_REPEATED_CALLS,
     ) -> CalebJRSession:
-        """Create a stateful session; one-shot callers retain the 30-second default."""
+        """Create a session while preserving conservative one-shot defaults."""
         return CalebJRSession(
             settings=self.provider_settings(context),
             context=context,
             request_timeout=request_timeout,
+            max_steps=max_steps,
+            max_invalid_responses=max_invalid_responses,
+            max_tool_failures=max_tool_failures,
+            max_repeated_calls=max_repeated_calls,
         )
 
     async def run(self, instruction: str, context: RunContext) -> str:
