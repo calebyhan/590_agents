@@ -203,7 +203,20 @@ def test_scripted_repl_reuses_session_and_selects_120_second_timeout(tmp_path: P
     (tmp_path / "note.txt").write_text("remember me")
     settings = ClientCreatingSettings()
     agent = FakeAgent(settings)
-    lines = iter(["read the note", "what did it say?", "/context", "/status", "/exit"])
+    lines = iter(
+        [
+            "read the note",
+            "what did it say?",
+            "/context",
+            "/activity",
+            "/activity show 1",
+            "/activity output A1",
+            "/transcript markdown",
+            "/activity detailed",
+            "/status",
+            "/exit",
+        ]
+    )
     output: list[str] = []
 
     result = asyncio.run(
@@ -227,6 +240,12 @@ def test_scripted_repl_reuses_session_and_selects_120_second_timeout(tmp_path: P
     assert "second answer" in output
     assert any("Session: 2 user turns, 1 tool events" in line for line in output)
     assert any("Destructive confirmation: disabled" in line for line in output)
+    assert "Activity mode: compact" in output
+    assert any("Read note.txt" in line for line in output)
+    assert any("A1 · Read note.txt" in line and "remember me" in line for line in output)
+    assert any("## User" in line and "## Tool output" in line for line in output)
+    assert "Activity mode changed to detailed." in output
+    assert any("Activity mode: detailed" in line for line in output)
     assert {"role": "user", "content": "read the note"} in settings.client.responses.inputs[-1]
 
 
@@ -528,9 +547,10 @@ def test_renderer_streams_clean_text_and_honors_modes() -> None:
     async def render_compact() -> None:
         await compact(ToolStarted("1", "cat", {"path": "secret.txt"}))
         await compact(ToolFinished("1", "cat", "x" * 501, False, 0.1))
+        await compact(TurnFinished("answer"))
 
     asyncio.run(render_compact())
-    assert compact_lines == ["→ cat", f"  {'x' * 500}\n… (1 characters omitted)"]
+    assert compact_lines == ["✓ 1 action · 0.10s · inspected 1", "answer"]
 
     verbose_lines: list[str] = []
     verbose = PlainRenderer(verbose_lines.append, mode="verbose", color=False)

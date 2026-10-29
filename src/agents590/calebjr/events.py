@@ -15,6 +15,8 @@ class ToolStarted:
     call_id: str
     name: str
     arguments: dict[str, str]
+    action_id: int | None = None
+    group_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -24,6 +26,9 @@ class ToolFinished:
     output: str
     failed: bool
     duration_seconds: float
+    outcome: str | None = None
+    action_id: int | None = None
+    group_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -79,8 +84,14 @@ class TurnFinished:
 
 
 @dataclass(frozen=True)
+class TurnCancelled:
+    reason: str = "Turn cancelled."
+
+
+@dataclass(frozen=True)
 class TurnFailed:
     error: str
+    kind: str = "internal"
 
 
 type SessionEvent = (
@@ -96,6 +107,7 @@ type SessionEvent = (
     | ModelTextDelta
     | ReasoningSummary
     | TurnFinished
+    | TurnCancelled
     | TurnFailed
 )
 

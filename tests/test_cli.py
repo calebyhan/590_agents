@@ -85,7 +85,7 @@ def test_cli_passes_instruction_workdir_and_model_to_the_selected_agent(
 def test_interactive_cli_allows_no_initial_instruction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    seen: list[tuple[CalebJR, RunContext, str | None, str]] = []
+    seen: list[tuple[CalebJR, RunContext, str | None, str | None]] = []
     agent = CalebJR()
 
     async def fake_repl(
@@ -105,7 +105,7 @@ def test_interactive_cli_allows_no_initial_instruction(
     monkeypatch.setattr(calebjr_repl, "run_repl", fake_repl)
 
     assert cli.main(["calebjr", "--interactive", "--cwd", str(tmp_path)]) == 0
-    assert seen == [(agent, RunContext(cwd=tmp_path), None, "default")]
+    assert seen == [(agent, RunContext(cwd=tmp_path), None, None)]
 
 
 def test_continue_shorthand_and_request_timeout(
@@ -149,7 +149,13 @@ def test_continue_shorthand_and_request_timeout(
 
 @pytest.mark.parametrize(
     ("flag", "expected_mode"),
-    [("--quiet", "quiet"), ("--compact", "compact"), ("--verbose", "verbose")],
+    [
+        ("--quiet", "quiet"),
+        ("--compact", "compact"),
+        ("--detailed", "default"),
+        ("--debug", "verbose"),
+        ("--verbose", "verbose"),
+    ],
 )
 def test_interactive_cli_selects_render_mode(
     flag: str,

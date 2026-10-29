@@ -1,37 +1,50 @@
 """Interactive terminal UI for CalebJR."""
 
 import asyncio
+import json
 import os
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from typing import cast
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import WordCompleter
 from prompt_toolkit.history import FileHistory
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.key_binding.key_processor import KeyPressEvent
 
 from agents590.calebjr import CalebJR
 from agents590.calebjr.redaction import bounded, redact_text
 from agents590.calebjr.render import PlainRenderer, RenderMode, terminal_renderer
 from agents590.calebjr.session import CalebJRSession
 from agents590.calebjr.transcript import session_path, sessions_dir
+from agents590.calebjr.tui import FullScreenUI
 from agents590.contracts import RunContext
 
 _HELP = """Commands:
-  /help        Show this help.
+  /help          Show this help.
+  /activity MODE Set activity detail: quiet, compact, detailed, or debug.
+  /activity show Show recent activity; optionally add a count or group ID.
+  /activity output ACTION_ID [--full]
+                 Show retained, redacted output for one action.
   /context       Show bounded session context statistics.
   /context --raw Show bounded, redacted canonical model context.
-  /status      Show token usage, estimated cost, and safety status.
-  /transcript  Show conversation and tool activity.
-  /compact     Summarize older completed turns.
-  /model NAME  Change the model for later turns.
-  /cwd PATH    Change the working directory for later turns.
-  /save [NAME] Save a redacted session atomically.
-  /clear       Clear conversation history (retains cwd and model).
-  /exit, /quit Exit the session.
+  /status        Show usage, cost, safety, and activity mode.
+  /transcript [compact|detailed|markdown]
+                 Show a bounded transcript in the selected format.
+  /compact       Summarize older completed turns.
+  /model NAME    Change the model for later turns.
+  /cwd PATH      Change the working directory for later turns.
+  /save [NAME]   Save a redacted session atomically.
+  /clear         Clear conversation history (retains cwd and model).
+  /exit, /quit   Exit the session.
 
 Input:
   Esc+Enter    Submit a multiline prompt.
+  Alt-V        Temporarily toggle compact/debug activity.
+  PgUp/PgDn   Scroll the full-screen session; F6 moves focus.
+  Alt-</Alt->  Jump to the top/bottom of full-screen output.
   Ctrl-D       Exit from an empty prompt."""
 
 INTERACTIVE_MAX_STEPS = 150
@@ -39,8 +52,55 @@ INTERACTIVE_MAX_INVALID_RESPONSES = 20
 INTERACTIVE_MAX_TOOL_FAILURES = 25
 INTERACTIVE_MAX_REPEATED_CALLS = 8
 
+_ACTIVITY_MODES: dict[str, RenderMode] = {
+    "quiet": "quiet",
+    "compact": "compact",
+    "detailed": "default",
+    "debug": "verbose",
+}
+_ACTIVITY_LABELS = {value: key for key, value in _ACTIVITY_MODES.items()}
+
+
+def _config_file() -> Path:
+    root = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return root / "agents590" / "calebjr" / "config.json"
+
+
+def _preferred_mode() -> RenderMode:
+    requested = os.environ.get("CALEBJR_ACTIVITY_MODE", "").strip().lower()
+    if requested in _ACTIVITY_MODES:
+        return _ACTIVITY_MODES[requested]
+    try:
+        loaded: object = json.loads(_config_file().read_text(encoding="utf-8"))
+        data = cast(dict[str, object], loaded) if isinstance(loaded, dict) else {}
+        configured = data.get("activity_mode")
+        if isinstance(configured, str) and configured in _ACTIVITY_MODES:
+            return _ACTIVITY_MODES[configured]
+    except (OSError, ValueError):
+        pass
+    return "compact"
+
+
+def _save_preferred_mode(mode: RenderMode) -> None:
+    path = _config_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps({"activity_mode": _ACTIVITY_LABELS[mode]}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
 _COMMANDS = [
     "/help",
+    "/activity",
+    "/activity quiet",
+    "/activity compact",
+    "/activity detailed",
+    "/activity debug",
+    "/activity show",
+    "/activity output",
     "/context",
     "/context --raw",
     "/status",
@@ -53,6 +113,31 @@ _COMMANDS = [
     "/exit",
     "/quit",
 ]
+
+
+def _format_transcript(items: list[tuple[str, str]], mode: str) -> str:
+    """Render a bounded, redacted transcript for explicit inspection or export."""
+    selected = items[-1_000:]
+    if mode == "compact":
+        selected = [(role, text) for role, text in selected if role != "tool"]
+    lines: list[str] = []
+    for role, raw_text in selected:
+        text = bounded(redact_text(raw_text), 20_000)
+        if mode == "markdown":
+            heading = {
+                "user": "User",
+                "assistant": "Assistant",
+                "tool": "Tool output",
+                "error": "Error",
+                "boundary": "Session",
+            }.get(role, role.title())
+            if role == "tool":
+                lines.append(f"## {heading}\n\n```text\n{text}\n```")
+            else:
+                lines.append(f"## {heading}\n\n{text}")
+        else:
+            lines.append(f"{role}: {text}")
+    return bounded("\n\n".join(lines), 100_000)
 
 
 def _history_file() -> Path:
@@ -71,12 +156,29 @@ async def run_repl(
     write_fn: Callable[[str], None] | None = None,
     request_timeout: float = 120.0,
     initial_instruction: str | None = None,
-    render_mode: RenderMode = "default",
+    render_mode: RenderMode | None = None,
     resume: str | Path | None = None,
     confirm_destructive: bool = False,
+    full_screen: bool = True,
 ) -> int:
     """Run one stateful session; injectable I/O keeps tests deterministic."""
     interactive_terminal = input_fn is None and output_fn is print and write_fn is None
+    use_tui = (
+        interactive_terminal
+        and full_screen
+        and os.environ.get("CALEBJR_TUI", "1").strip().lower() not in {"0", "false", "no"}
+        and sys.stdin.isatty()
+        and sys.stdout.isatty()
+    )
+    tui = FullScreenUI(completer=WordCompleter(_COMMANDS, sentence=True)) if use_tui else None
+    if tui is not None:
+        output_fn = tui.line
+        write_fn = tui.write
+    selected_mode = (
+        _preferred_mode()
+        if render_mode is None and interactive_terminal
+        else render_mode or "compact"
+    )
     if write_fn is None:
         if output_fn is print:
 
@@ -88,15 +190,25 @@ async def run_repl(
         else:
             write_fn = output_fn
     renderer = (
-        terminal_renderer(mode=render_mode)
-        if interactive_terminal
-        else PlainRenderer(output_fn, write=write_fn, mode=render_mode)
+        terminal_renderer(mode=selected_mode)
+        if interactive_terminal and tui is None
+        else PlainRenderer(output_fn, write=write_fn, mode=selected_mode)
     )
     prompt_session: PromptSession[str] | None = None
+    if tui is not None:
+
+        def toggle_tui_activity() -> None:
+            mode: RenderMode = "compact" if renderer.mode == "verbose" else "verbose"
+            renderer.set_mode(mode)
+
+        tui.set_activity_toggle(toggle_tui_activity)
+        await tui.start()
 
     async def confirm(command: str) -> bool:
         try:
-            if prompt_session is not None:
+            if tui is not None:
+                answer = await tui.prompt("Execute? [y/N] ")
+            elif prompt_session is not None:
                 answer = await prompt_session.prompt_async("Execute? [y/N] ")
             else:
                 if input_fn is None:
@@ -112,7 +224,9 @@ async def run_repl(
         if not candidate.is_relative_to(sessions_dir().resolve()):
             output_fn(f"Session file is outside the CalebJR data directory:\n{candidate}")
             try:
-                if input_fn is None:
+                if tui is not None:
+                    answer = await tui.prompt("Trust and load it? [y/N] ")
+                elif input_fn is None:
                     answer = await asyncio.to_thread(input, "Trust and load it? [y/N] ")
                 else:
                     answer = input_fn("Trust and load it? [y/N] ")
@@ -121,6 +235,8 @@ async def run_repl(
             allow_external_resume = answer.strip().lower() in {"y", "yes"}
             if not allow_external_resume:
                 output_fn("Session load cancelled.")
+                if tui is not None:
+                    await tui.close()
                 return 1
 
     if resume is None:
@@ -147,23 +263,53 @@ async def run_repl(
             allow_external=allow_external_resume,
         )
     session.event_sink = renderer
-    if input_fn is None:
+    renderer.restore_activity(session.event_log)
+    if input_fn is None and tui is None:
+        key_bindings = KeyBindings()
+
+        @key_bindings.add("escape", "v")
+        def toggle_activity(event: KeyPressEvent) -> None:
+            mode: RenderMode = "compact" if renderer.mode == "verbose" else "verbose"
+            renderer.set_mode(mode)
+            event.app.invalidate()
+
         prompt_session = PromptSession(
             history=FileHistory(str(_history_file())),
             completer=WordCompleter(_COMMANDS, sentence=True),
             complete_while_typing=True,
             bottom_toolbar=session.toolbar_summary,
+            key_bindings=key_bindings,
         )
 
-    output_fn(f"CalebJR · {session.cwd.name} · {session.model}")
-    output_fn("Type /help for commands.")
+    if tui is not None:
+        tui.set_status_provider(session.toolbar_summary)
+    if tui is not None:
+        tui.show_welcome(
+            cwd=session.cwd,
+            model=session.model,
+            activity_mode=_ACTIVITY_LABELS[renderer.mode],
+            resumed=resume is not None,
+        )
+    else:
+        output_fn(f"CalebJR · {session.cwd.name} · {session.model}")
+        output_fn("Type /help for commands.")
     interrupt_pending = False
+
+    async def run_turn(instruction: str) -> None:
+        turn = asyncio.create_task(session.run_turn(instruction))
+        if tui is None:
+            await turn
+        else:
+            await tui.run_interruptibly(turn)
+
     try:
         if initial_instruction and initial_instruction.strip():
-            await session.run_turn(initial_instruction)
+            await run_turn(initial_instruction)
         while True:
             try:
-                if prompt_session is not None:
+                if tui is not None:
+                    line = await tui.prompt("> ")
+                elif prompt_session is not None:
                     line = await prompt_session.prompt_async("> ", multiline=True)
                 else:
                     assert input_fn is not None
@@ -186,6 +332,51 @@ async def run_repl(
             if command == "/help":
                 output_fn(_HELP)
                 continue
+            if command == "/activity" or command.startswith("/activity "):
+                parts = command.split()
+                if len(parts) == 1:
+                    output_fn(f"Activity mode: {_ACTIVITY_LABELS[renderer.mode]}")
+                elif parts[1] == "show":
+                    if len(parts) == 3 and parts[2].startswith("g"):
+                        output_fn(renderer.activity_group(parts[2]))
+                    else:
+                        try:
+                            limit = 1 if len(parts) == 2 else int(parts[2])
+                            if len(parts) > 3 or not 1 <= limit <= 20:
+                                raise ValueError
+                        except (IndexError, ValueError):
+                            output_fn("Usage: /activity show [1-20|GGROUP_ID]")
+                        else:
+                            output_fn(renderer.activity_report(limit))
+                elif parts[1] == "output":
+                    full = len(parts) == 4 and parts[3] == "--full"
+                    if len(parts) not in {3, 4} or (len(parts) == 4 and not full):
+                        output_fn("Usage: /activity output ACTION_ID [--full]")
+                    else:
+                        rendered = redact_text(renderer.activity_output(parts[2], full=full))
+                        if full:
+                            rendered = (
+                                "Warning: full tool output may contain sensitive project data; "
+                                "likely credentials are redacted.\n" + rendered
+                            )
+                        output_fn(rendered)
+                elif len(parts) == 2 and parts[1] in _ACTIVITY_MODES:
+                    renderer.set_mode(_ACTIVITY_MODES[parts[1]])
+                    if interactive_terminal:
+                        try:
+                            _save_preferred_mode(cast(RenderMode, renderer.mode))
+                        except OSError as error:
+                            output_fn(
+                                f"Activity mode changed, but preference was not saved: {error}"
+                            )
+                            continue
+                    output_fn(f"Activity mode changed to {parts[1]}.")
+                else:
+                    output_fn(
+                        "Usage: /activity quiet|compact|detailed|debug|show [1-20]|"
+                        "output ACTION_ID [--full]"
+                    )
+                continue
             if command == "/context":
                 output_fn(session.context_summary())
                 continue
@@ -193,18 +384,19 @@ async def run_repl(
                 output_fn(session.raw_context())
                 continue
             if command == "/status":
-                output_fn(session.status_summary())
+                output_fn(
+                    f"{session.status_summary()}\nActivity mode: {_ACTIVITY_LABELS[renderer.mode]}"
+                )
                 continue
-            if command == "/transcript":
-                if not session.visible_transcript:
+            if command == "/transcript" or command.startswith("/transcript "):
+                parts = command.split()
+                transcript_mode = "detailed" if len(parts) == 1 else parts[1]
+                if len(parts) > 2 or transcript_mode not in {"compact", "detailed", "markdown"}:
+                    output_fn("Usage: /transcript [compact|detailed|markdown]")
+                elif not session.visible_transcript:
                     output_fn("Transcript is empty.")
                 else:
-                    output_fn(
-                        "\n".join(
-                            f"{role}: {bounded(redact_text(text), 20_000)}"
-                            for role, text in session.visible_transcript[-1_000:]
-                        )
-                    )
+                    output_fn(_format_transcript(session.visible_transcript, transcript_mode))
                 continue
             if command == "/compact":
                 output_fn(
@@ -245,17 +437,20 @@ async def run_repl(
                 continue
             if command == "/clear":
                 session.clear()
+                renderer.restore_activity([])
                 output_fn("Session history cleared.")
                 continue
             if instruction.startswith("/"):
                 output_fn(f"Unknown command: {instruction}. Type /help.")
                 continue
             try:
-                await session.run_turn(instruction)
+                await run_turn(instruction)
             except (KeyboardInterrupt, asyncio.CancelledError):
                 interrupt_pending = True
-                output_fn("Turn cancelled. Press Ctrl-C again to quit.")
+                output_fn("Press Ctrl-C again to quit, or enter a prompt to continue.")
                 continue
     finally:
         await session.close()
+        if tui is not None:
+            await tui.close()
     return 0

@@ -33,6 +33,53 @@ agents590 krisj_echo -i "An instruction from another project"
 Changes to implementation source are picked up by new invocations. Reinstall or
 run `uv sync` after changing entry-point registrations in `pyproject.toml`.
 
+### CalebJR interactive activity
+
+```sh
+uv run agents590 calebjr --interactive --cwd /path/to/project
+```
+
+Interactive terminals open a full-screen interface that retains the complete session
+scrollback in memory instead of relying on the terminal's limited history. Use
+`PgUp`/`PgDn` to scroll, `Alt-<`/`Alt->` to jump to the beginning or end, and `F6` to
+move focus between output and input. `Alt-Enter` inserts a newline and Enter submits.
+Set `CALEBJR_TUI=0` to use the classic terminal REPL; redirected and non-TTY sessions
+always use plain output.
+
+Interactive sessions use compact activity by default: routine tool calls are grouped
+into one turn summary, while failures and confirmation prompts remain visible. Change
+the detail level at startup with `--quiet`, `--compact`, `--detailed`, or `--debug`
+(`--verbose` remains a compatibility alias for debug), or at any time inside the REPL:
+
+```text
+/activity quiet
+/activity compact
+/activity detailed
+/activity debug
+/activity show 3
+```
+
+Run `/activity` to show the current mode. `/activity show [N]` expands recent grouped
+actions and `/activity show G3` selects one group without exposing file contents or
+edit text. Actions and groups receive stable IDs such as `A8` and `G3`;
+`/activity output A8` shows a redacted 2,000-character
+preview and `/activity output A8 --full` explicitly requests the retained output
+(up to the session's 100,000-character tool-output limit). Activity is reconstructed
+from saved events when a session resumes. `/status` also reports the mode.
+
+The selected mode is saved for real interactive terminals under the XDG config
+directory. `CALEBJR_ACTIVITY_MODE=quiet|compact|detailed|debug` overrides it. Set
+`CALEBJR_REDUCED_MOTION=1` to replace animated status displays with static updates.
+In an interactive terminal, compact mode shows a semantic live phase such as
+`Inspecting project`, `Updating files`, or `Running checks`, along with elapsed time.
+Provider-supplied reasoning summaries appear as durable, de-duplicated clumps; they
+are bounded per turn, associated with activity history, and are never raw internal
+reasoning traces. Failures classify timeouts, denials, cancellation, and other errors;
+Ctrl-C preserves completed and in-flight activity for inspection while rolling back
+incomplete model context. `/transcript compact`, `/transcript detailed`, and
+`/transcript markdown` provide bounded, redacted transcript views and clean Markdown
+export output.
+
 ## Add an agent
 
 1. Create a package such as `src/agents590/my_agent/`.

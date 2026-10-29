@@ -24,6 +24,8 @@ class Arguments(argparse.Namespace):
     interactive: bool
     quiet: bool
     compact: bool
+    detailed: bool
+    debug: bool
     verbose: bool
     resume: str | None
     confirm_destructive: bool
@@ -63,8 +65,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     detail = parser.add_mutually_exclusive_group()
     detail.add_argument("--quiet", action="store_true", help="Show only answers and errors")
-    detail.add_argument("--compact", action="store_true", help="Show condensed interactive events")
-    detail.add_argument("--verbose", action="store_true", help="Show complete interactive events")
+    detail.add_argument("--compact", action="store_true", help="Show grouped interactive activity")
+    detail.add_argument(
+        "--detailed", action="store_true", help="Show each tool call with bounded output"
+    )
+    detail.add_argument("--debug", action="store_true", help="Show complete interactive events")
+    detail.add_argument(
+        "--verbose",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args(argv, namespace=Arguments())
     if args.list_agents:
         print("\n".join(agent_names()))
@@ -84,8 +94,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--request-timeout requires --interactive or --continue")
     if args.request_timeout is not None and args.request_timeout <= 0:
         parser.error("--request-timeout must be positive")
-    if not interactive and (args.quiet or args.compact or args.verbose):
-        parser.error("--quiet, --compact, and --verbose require --interactive")
+    if not interactive and (
+        args.quiet or args.compact or args.detailed or args.debug or args.verbose
+    ):
+        parser.error("activity detail flags require --interactive")
     cwd = args.cwd.expanduser().resolve()
     if not cwd.is_dir():
         parser.error("--cwd must name an existing directory")
@@ -99,16 +111,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         context = RunContext(cwd=cwd, model=args.model)
         if interactive:
             from agents590.calebjr import CalebJR
+            from agents590.calebjr.render import RenderMode
             from agents590.calebjr.repl import run_repl
 
             if not isinstance(agent, CalebJR):
                 raise ValueError(f"Agent {args.agent!r} does not support interactive sessions.")
-            render_mode = "default"
+            render_mode: RenderMode | None = None
             if args.quiet:
                 render_mode = "quiet"
             elif args.compact:
                 render_mode = "compact"
-            elif args.verbose:
+            elif args.detailed:
+                render_mode = "default"
+            elif args.debug or args.verbose:
                 render_mode = "verbose"
             return asyncio.run(
                 run_repl(

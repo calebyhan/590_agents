@@ -29,6 +29,7 @@ from agents590.calebjr.events import (
     SessionEvent,
     ToolFinished,
     ToolStarted,
+    TurnCancelled,
     TurnFailed,
     TurnFinished,
     TurnStarted,
@@ -153,6 +154,7 @@ class CalebJRSession:
         self.user_turn_count: int = 0
         self.assistant_turn_count: int = 0
         self.tool_call_count: int = 0
+        self.activity_group_count: int = 0
         self.usage = UsageLedger()
         self.confirm_destructive = confirm_destructive
         self.confine_filesystem = confine_filesystem
@@ -197,17 +199,32 @@ class CalebJRSession:
 
     @staticmethod
     def tool_failed(result: str) -> bool:
-        return result.startswith(
-            (
-                "Tool error:",
-                "Error ",
-                "Command failed ",
-                "Command timed out ",
-                "Command not executed:",
-                "Safety review failed",
-                "Safety review rejected",
-            )
-        )
+        return CalebJRSession.tool_outcome(result) != "success"
+
+    @staticmethod
+    def tool_outcome(result: str) -> str:
+        """Classify failures for concise UI and persisted activity history."""
+        lowered = result.lower()
+        if result.startswith("Command timed out "):
+            return "timeout"
+        if result.startswith(("Command not executed:", "Safety review rejected")):
+            return "denied"
+        if "permission denied" in lowered or "operation not permitted" in lowered:
+            return "denied"
+        if result.startswith(("Tool error:", "Error ", "Command failed ", "Safety review failed")):
+            return "failed"
+        return "success"
+
+    @staticmethod
+    def failure_kind(error: BaseException) -> str:
+        if isinstance(error, (TimeoutError, asyncio.TimeoutError)):
+            return "timeout"
+        lowered = f"{type(error).__name__}: {error}".lower()
+        if "timeout" in lowered or "timed out" in lowered:
+            return "timeout"
+        if "permission" in lowered or "unauthorized" in lowered or "forbidden" in lowered:
+            return "permission"
+        return "model"
 
     async def _emit(self, event: SessionEvent) -> None:
         fields = vars(event)
@@ -266,6 +283,14 @@ class CalebJRSession:
         self.assistant_turn_count += 1
         self.visible_transcript.append(("assistant", text))
         await self._emit(TurnFinished(text))
+        return TurnResult(text)
+
+    async def _finish_failure(self, text: str, kind: str) -> TurnResult:
+        """Record a failed turn once without also emitting a normal completion."""
+        self.updated_at = timestamp()
+        self.assistant_turn_count += 1
+        self.visible_transcript.append(("error", text))
+        await self._emit(TurnFailed(text, kind))
         return TurnResult(text)
 
     @staticmethod
@@ -375,6 +400,7 @@ class CalebJRSession:
         self.user_turn_count += 1
         if self._goal is None:
             self._goal = instruction
+        self.activity_group_count += 1
         await self._emit(TurnStarted(instruction))
         await self._emit(Progress("Processing request."))
         last_call: tuple[str, str] | None = None
@@ -386,9 +412,13 @@ class CalebJRSession:
                 try:
                     response, streamed_reasoning = await self._request_model()
                 except Exception as error:
-                    text = f"Model request failed: {error}"
-                    await self._emit(TurnFailed(text))
-                    return await self._finish(text)
+                    kind = self.failure_kind(error)
+                    text = (
+                        f"Model request {kind}: {error}"
+                        if kind != "model"
+                        else f"Model request failed: {error}"
+                    )
+                    return await self._finish_failure(text, kind)
                 self.usage.add_response(response, model=self.model)
                 if not streamed_reasoning:
                     await self._emit_response_reasoning(response)
@@ -458,8 +488,16 @@ class CalebJRSession:
                     ):
                         raise ValueError("Invalid tool arguments")
                     args = cast(dict[str, str], parsed)
-                    await self._emit(ToolStarted(call.call_id, call.name, args))
                     self.tool_call_count += 1
+                    await self._emit(
+                        ToolStarted(
+                            call.call_id,
+                            call.name,
+                            args,
+                            self.tool_call_count,
+                            self.activity_group_count,
+                        )
+                    )
                     if call.name == "shell":
                         command = args["command"]
                         if self.requires_safety_review(command):
@@ -486,6 +524,9 @@ class CalebJRSession:
                         output,
                         self.tool_failed(output),
                         time.monotonic() - started,
+                        self.tool_outcome(output),
+                        self.tool_call_count,
+                        self.activity_group_count,
                     )
                 )
                 self.visible_transcript.append(("tool", f"{call.name}: {output}"))
@@ -506,10 +547,10 @@ class CalebJRSession:
         except (asyncio.CancelledError, KeyboardInterrupt):
             del self.history[checkpoint:]
             del self.visible_transcript[transcript_checkpoint:]
-            self.user_turn_count, self.assistant_turn_count, self.tool_call_count = counters
+            self.user_turn_count, self.assistant_turn_count = counters[:2]
             if not self.user_turn_count:
                 self._goal = None
-            await self._emit(TurnFailed("Turn cancelled."))
+            await self._emit(TurnCancelled())
             raise
 
     def clear(self) -> None:
@@ -518,6 +559,7 @@ class CalebJRSession:
         self.event_log.clear()
         self.boundaries.clear()
         self.user_turn_count = self.assistant_turn_count = self.tool_call_count = 0
+        self.activity_group_count = 0
         self.compaction_count = 0
         self._goal = None
 
@@ -652,6 +694,7 @@ class CalebJRSession:
                 "user": self.user_turn_count,
                 "assistant": self.assistant_turn_count,
                 "tools": self.tool_call_count,
+                "activity_groups": self.activity_group_count,
                 "compactions": self.compaction_count,
             },
             "goal": self._goal,
@@ -735,6 +778,7 @@ class CalebJRSession:
         session.user_turn_count = int(counts.get("user", 0))
         session.assistant_turn_count = int(counts.get("assistant", 0))
         session.tool_call_count = int(counts.get("tools", 0))
+        session.activity_group_count = int(counts.get("activity_groups", session.user_turn_count))
         session.compaction_count = int(counts.get("compactions", 0))
         session.boundaries = [str(item) for item in data.get("boundaries", [])]
         session.session_id = str(data.get("session_id") or session.session_id)
