@@ -1,13 +1,15 @@
 """Exercise CalebJR's stateful core without contacting a provider."""
 
 import asyncio
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
+import pytest
 from openai import AsyncOpenAI
 
-from agents590.calebjr import CalebJR
+from agents590.calebjr import CalebJR, repl
 from agents590.calebjr.events import (
     CollectingEventSink,
     ModelTextDelta,
@@ -561,3 +563,107 @@ def test_renderer_streams_clean_text_and_honors_modes() -> None:
     colored = PlainRenderer(colored_lines.append, mode="default", color=True)
     asyncio.run(colored(ReasoningSummary("Explicit provider summary.")))
     assert colored_lines == ["\033[2mReasoning summary: Explicit provider summary.\033[0m"]
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        ("cat", '"note.txt"'),
+        ("cat", "{}"),
+        ("cat", '{"path": "note.txt", "extra": "x"}'),
+        ("cat", '{"path": 1}'),
+        ("move", '{"src": "a"}'),
+    ],
+)
+def test_parse_tool_arguments_rejects_malformed_calls(name: str, arguments: str) -> None:
+    call = SimpleNamespace(call_id="call-1", name=name, arguments=arguments)
+
+    with pytest.raises(ValueError, match="Invalid tool arguments"):
+        CalebJRSession._parse_tool_arguments(call)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_parse_tool_arguments_accepts_exact_string_arguments() -> None:
+    call = SimpleNamespace(call_id="call-1", name="move", arguments='{"src": "a", "dst": "b"}')
+
+    parsed = CalebJRSession._parse_tool_arguments(call)  # pyright: ignore[reportPrivateUsage]
+
+    assert parsed == {"src": "a", "dst": "b"}
+
+
+@pytest.mark.parametrize(
+    ("output", "outcome"),
+    [
+        ('if "permission denied" in lowered:\n    return "denied"', "success"),
+        ("grep: operation not permitted appears in docs", "success"),
+        ("Error reading file secret: [Errno 13] Permission denied: 'secret'", "denied"),
+        ("Command failed with exit code 1.\nbash: ./run: Permission denied", "denied"),
+        ("Command failed with exit code 2.\nno such file", "failed"),
+        ("Command not executed: user confirmation declined.", "denied"),
+    ],
+)
+def test_tool_outcome_only_reads_permission_text_from_failures(output: str, outcome: str) -> None:
+    assert CalebJRSession.tool_outcome(output) == outcome
+
+
+class FakeFullScreenUI:
+    def __init__(self, **kwargs: object) -> None:
+        self.lines: list[str] = []
+
+    async def start(self) -> None:
+        pass
+
+    async def close(self) -> None:
+        pass
+
+    def set_activity_toggle(self, callback: object) -> None:
+        pass
+
+    def set_status_provider(self, provider: object) -> None:
+        pass
+
+    def show_welcome(self, **kwargs: object) -> None:
+        pass
+
+    def line(self, text: str = "") -> None:
+        self.lines.append(text + "\n")
+
+    def write(self, text: str) -> None:
+        self.lines.append(text)
+
+    async def prompt(self, prompt: str = "> ") -> str:
+        raise EOFError
+
+    async def run_interruptibly(self, awaitable: "asyncio.Task[object]") -> object:
+        return await awaitable
+
+
+def test_full_screen_output_contains_no_raw_ansi_escapes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "note.txt").write_text("remember me")
+    created: list[FakeFullScreenUI] = []
+
+    def make_ui(**kwargs: object) -> FakeFullScreenUI:
+        created.append(FakeFullScreenUI(**kwargs))
+        return created[-1]
+
+    monkeypatch.setattr(repl, "FullScreenUI", make_ui)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("CALEBJR_TUI", raising=False)
+
+    result = asyncio.run(
+        run_repl(
+            FakeAgent(ClientCreatingSettings()),
+            RunContext(cwd=tmp_path),
+            initial_instruction="read the note",
+            full_screen=True,
+        )
+    )
+
+    output = "".join(created[0].lines)
+    assert result == 0
+    assert "Processing request." in output
+    assert "\x1b" not in output

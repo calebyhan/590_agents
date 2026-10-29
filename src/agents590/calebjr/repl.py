@@ -16,7 +16,7 @@ from prompt_toolkit.key_binding.key_processor import KeyPressEvent
 
 from agents590.calebjr import CalebJR
 from agents590.calebjr.redaction import bounded, redact_text
-from agents590.calebjr.render import PlainRenderer, RenderMode, terminal_renderer
+from agents590.calebjr.render import PlainRenderer, RenderMode, RichRenderer, terminal_renderer
 from agents590.calebjr.session import CalebJRSession
 from agents590.calebjr.transcript import session_path, sessions_dir
 from agents590.calebjr.tui import FullScreenUI
@@ -41,11 +41,15 @@ _HELP = """Commands:
   /exit, /quit   Exit the session.
 
 Input:
-  Esc+Enter    Submit a multiline prompt.
+  Enter        Submit the prompt.
+  Ctrl-J       Insert a newline (also Alt-Enter, or end a line with \\).
   Alt-V        Temporarily toggle compact/debug activity.
-  PgUp/PgDn   Scroll the full-screen session; F6 moves focus.
-  Alt-</Alt->  Jump to the top/bottom of full-screen output.
-  Ctrl-D       Exit from an empty prompt."""
+  Ctrl-C       Cancel the running turn; press twice at the prompt to quit.
+  Ctrl-D       Exit from an empty prompt.
+
+Full-screen mode (CALEBJR_TUI=1):
+  PgUp/PgDn    Scroll output; F6 moves focus.
+  Alt-</Alt->  Jump to the top/bottom of output."""
 
 INTERACTIVE_MAX_STEPS = 150
 INTERACTIVE_MAX_INVALID_RESPONSES = 20
@@ -140,6 +144,36 @@ def _format_transcript(items: list[tuple[str, str]], mode: str) -> str:
     return bounded("\n\n".join(lines), 100_000)
 
 
+def prompt_key_bindings(renderer: PlainRenderer | RichRenderer) -> KeyBindings:
+    """Mirror Claude Code: Enter submits; Ctrl-J, Alt-Enter, or a trailing ``\\`` add a line."""
+    bindings = KeyBindings()
+
+    @bindings.add("enter")
+    def submit(event: KeyPressEvent) -> None:
+        buffer = event.current_buffer
+        completion = buffer.complete_state.current_completion if buffer.complete_state else None
+        if completion is not None:
+            buffer.apply_completion(completion)
+        elif buffer.document.text_before_cursor.endswith("\\"):
+            buffer.delete_before_cursor()
+            buffer.insert_text("\n")
+        else:
+            buffer.validate_and_handle()
+
+    @bindings.add("c-j")
+    @bindings.add("escape", "enter")
+    def newline(event: KeyPressEvent) -> None:
+        event.current_buffer.insert_text("\n")
+
+    @bindings.add("escape", "v")
+    def toggle_activity(event: KeyPressEvent) -> None:
+        mode: RenderMode = "compact" if renderer.mode == "verbose" else "verbose"
+        renderer.set_mode(mode)
+        event.app.invalidate()
+
+    return bindings
+
+
 def _history_file() -> Path:
     state_home = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
     path = state_home / "agents590" / "calebjr" / "history"
@@ -159,14 +193,16 @@ async def run_repl(
     render_mode: RenderMode | None = None,
     resume: str | Path | None = None,
     confirm_destructive: bool = False,
-    full_screen: bool = True,
+    full_screen: bool = False,
 ) -> int:
     """Run one stateful session; injectable I/O keeps tests deterministic."""
     interactive_terminal = input_fn is None and output_fn is print and write_fn is None
+    # Inline output keeps native scrollback and copy/paste; full-screen is opt-in.
     use_tui = (
         interactive_terminal
-        and full_screen
-        and os.environ.get("CALEBJR_TUI", "1").strip().lower() not in {"0", "false", "no"}
+        and (
+            full_screen or os.environ.get("CALEBJR_TUI", "").strip().lower() in {"1", "true", "yes"}
+        )
         and sys.stdin.isatty()
         and sys.stdout.isatty()
     )
@@ -192,7 +228,13 @@ async def run_repl(
     renderer = (
         terminal_renderer(mode=selected_mode)
         if interactive_terminal and tui is None
-        else PlainRenderer(output_fn, write=write_fn, mode=selected_mode)
+        else PlainRenderer(
+            output_fn,
+            write=write_fn,
+            mode=selected_mode,
+            # The full-screen output control shows escape sequences literally.
+            color=False if tui is not None else None,
+        )
     )
     prompt_session: PromptSession[str] | None = None
     if tui is not None:
@@ -265,20 +307,14 @@ async def run_repl(
     session.event_sink = renderer
     renderer.restore_activity(session.event_log)
     if input_fn is None and tui is None:
-        key_bindings = KeyBindings()
-
-        @key_bindings.add("escape", "v")
-        def toggle_activity(event: KeyPressEvent) -> None:
-            mode: RenderMode = "compact" if renderer.mode == "verbose" else "verbose"
-            renderer.set_mode(mode)
-            event.app.invalidate()
-
         prompt_session = PromptSession(
             history=FileHistory(str(_history_file())),
             completer=WordCompleter(_COMMANDS, sentence=True),
             complete_while_typing=True,
             bottom_toolbar=session.toolbar_summary,
-            key_bindings=key_bindings,
+            key_bindings=prompt_key_bindings(renderer),
+            multiline=True,
+            prompt_continuation="  ",
         )
 
     if tui is not None:
@@ -310,7 +346,7 @@ async def run_repl(
                 if tui is not None:
                     line = await tui.prompt("> ")
                 elif prompt_session is not None:
-                    line = await prompt_session.prompt_async("> ", multiline=True)
+                    line = await prompt_session.prompt_async("> ")
                 else:
                     assert input_fn is not None
                     line = input_fn("> ")

@@ -82,6 +82,22 @@ class TurnResult:
     text: str
 
 
+@dataclass
+class _LoopState:
+    """Small, explicit state machine for one model/tool turn."""
+
+    last_call: tuple[str, str] | None = None
+    repeated_calls: int = 0
+    invalid_responses: int = 0
+    tool_failures: int = 0
+
+    def observe_call(self, call: "_FunctionCall") -> int:
+        current = (call.name, call.arguments)
+        self.repeated_calls = self.repeated_calls + 1 if current == self.last_call else 0
+        self.last_call = current
+        return self.repeated_calls
+
+
 class _FunctionCall(Protocol):
     call_id: str
     name: str
@@ -209,11 +225,14 @@ class CalebJRSession:
             return "timeout"
         if result.startswith(("Command not executed:", "Safety review rejected")):
             return "denied"
+        if not result.startswith(
+            ("Tool error:", "Error ", "Command failed ", "Safety review failed")
+        ):
+            return "success"
+        # Only inspect failure text: successful output (e.g. a source file) may quote these phrases.
         if "permission denied" in lowered or "operation not permitted" in lowered:
             return "denied"
-        if result.startswith(("Tool error:", "Error ", "Command failed ", "Safety review failed")):
-            return "failed"
-        return "success"
+        return "failed"
 
     @staticmethod
     def failure_kind(error: BaseException) -> str:
@@ -386,6 +405,81 @@ class CalebJRSession:
         await self._emit(DestructiveConfirmationFinished(command, approved))
         return approved
 
+    @staticmethod
+    def _limit_message(limit: str) -> str:
+        return (
+            f"Turn stopped after reaching the {limit} limit. "
+            "The session is intact; ask me to continue."
+        )
+
+    @staticmethod
+    def _parse_tool_arguments(call: _FunctionCall) -> dict[str, str]:
+        expected = TOOL_ARGS[call.name]
+        parsed = json.loads(call.arguments)
+        if not isinstance(parsed, dict):
+            raise ValueError("Invalid tool arguments")
+        arguments = cast(dict[str, Any], parsed)
+        if set(arguments) != set(expected) or any(
+            not isinstance(arguments[key], str) for key in expected
+        ):
+            raise ValueError("Invalid tool arguments")
+        return cast(dict[str, str], arguments)
+
+    async def _execute_tool(
+        self, call: _FunctionCall, args: dict[str, str], instruction: str
+    ) -> str:
+        if call.name != "shell":
+            confined_args = self._confined_tool_args(call.name, args)
+            with chdir(self.cwd):
+                return str(getattr(Tools, call.name)(**confined_args))
+
+        command = args["command"]
+        if self.requires_safety_review(command):
+            review = await self.safety_review(instruction, command)
+            if review != "APPROVE":
+                return review
+            if not await self._confirm_command(command):
+                return "Command not executed: user confirmation declined."
+        return await Tools.shell_async(command, cwd=str(self.cwd))
+
+    async def _dispatch_tool(self, call: _FunctionCall, instruction: str) -> str:
+        """Validate, execute, and record exactly one provider tool call."""
+        started = time.monotonic()
+        try:
+            args = self._parse_tool_arguments(call)
+            self.tool_call_count += 1
+            await self._emit(
+                ToolStarted(
+                    call.call_id,
+                    call.name,
+                    args,
+                    self.tool_call_count,
+                    self.activity_group_count,
+                )
+            )
+            result = await self._execute_tool(call, args, instruction)
+        except Exception as error:
+            result = f"Tool error: {error}"
+
+        output = bounded(str(result), self.MAX_TOOL_OUTPUT)
+        await self._emit(
+            ToolFinished(
+                call.call_id,
+                call.name,
+                output,
+                self.tool_failed(output),
+                time.monotonic() - started,
+                self.tool_outcome(output),
+                self.tool_call_count,
+                self.activity_group_count,
+            )
+        )
+        self.visible_transcript.append(("tool", f"{call.name}: {output}"))
+        self.history.append(
+            {"type": "function_call_output", "call_id": call.call_id, "output": output}
+        )
+        return output
+
     async def run_turn(self, instruction: str) -> TurnResult:
         """Run one turn, retaining complete response/tool history for the next turn."""
         if not instruction.strip():
@@ -403,10 +497,7 @@ class CalebJRSession:
         self.activity_group_count += 1
         await self._emit(TurnStarted(instruction))
         await self._emit(Progress("Processing request."))
-        last_call: tuple[str, str] | None = None
-        repeated_call_count = 0
-        invalid_response_count = 0
-        tool_failure_count = 0
+        state = _LoopState()
         try:
             for _ in range(self.max_steps):
                 try:
@@ -427,123 +518,50 @@ class CalebJRSession:
                 if not calls:
                     answer = (response.output_text or "").strip()
                     tool_names = "|".join(re.escape(name) for name in TOOL_ARGS)
-                    if re.search(rf"\[({tool_names})\]\(", answer):
-                        invalid_response_count += 1
-                        if invalid_response_count > self.max_invalid_responses:
-                            return await self._finish(
-                                "Turn stopped after reaching the invalid-response limit. "
-                                "The session is intact; ask me to continue."
-                            )
-                        self.history.append(
-                            {
-                                "role": "user",
-                                "content": (
-                                    "Invalid response: use a function call rather than writing a "
-                                    "text-based tool call. Please correct the response."
-                                ),
-                            }
-                        )
-                        continue
-                    return await self._finish(
-                        answer.removeprefix("FINAL:").strip() or "No answer generated."
+                    if not re.search(rf"\[({tool_names})\]\(", answer):
+                        text = answer.removeprefix("FINAL:").strip() or "No answer generated."
+                        return await self._finish(text)
+
+                    state.invalid_responses += 1
+                    if state.invalid_responses > self.max_invalid_responses:
+                        return await self._finish(self._limit_message("invalid-response"))
+                    self.history.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Invalid response: use a function call rather than writing a "
+                                "text-based tool call. Please correct the response."
+                            ),
+                        }
                     )
-                if len(calls) != 1:
-                    invalid_response_count += 1
-                    error = "Invalid response: make exactly one tool call at a time."
-                    for call in calls:
-                        self.history.append(
-                            {
-                                "type": "function_call_output",
-                                "call_id": call.call_id,
-                                "output": error,
-                            }
-                        )
-                    if invalid_response_count > self.max_invalid_responses:
-                        return await self._finish(
-                            "Turn stopped after reaching the invalid-response limit. "
-                            "The session is intact; ask me to continue."
-                        )
                     continue
-                call = calls[0]
-                current_call = (call.name, call.arguments)
-                if current_call == last_call:
-                    repeated_call_count += 1
-                    if repeated_call_count > self.max_repeated_calls:
-                        return await self._finish(
-                            "Turn stopped after reaching the repeated-call limit. "
-                            "The session is intact; ask me to continue."
-                        )
-                else:
-                    repeated_call_count = 0
-                last_call = current_call
-                started = time.monotonic()
-                try:
-                    parsed: Any = json.loads(call.arguments)
-                    expected = TOOL_ARGS[call.name]
-                    if (
-                        not isinstance(parsed, dict)
-                        or len(cast(dict[str, Any], parsed)) != len(expected)
-                        or not all(key in parsed for key in expected)
-                        or any(not isinstance(parsed[key], str) for key in expected)
-                    ):
-                        raise ValueError("Invalid tool arguments")
-                    args = cast(dict[str, str], parsed)
-                    self.tool_call_count += 1
-                    await self._emit(
-                        ToolStarted(
-                            call.call_id,
-                            call.name,
-                            args,
-                            self.tool_call_count,
-                            self.activity_group_count,
-                        )
+
+                if len(calls) != 1:
+                    state.invalid_responses += 1
+                    error = "Invalid response: make exactly one tool call at a time."
+                    self.history.extend(
+                        {
+                            "type": "function_call_output",
+                            "call_id": call.call_id,
+                            "output": error,
+                        }
+                        for call in calls
                     )
-                    if call.name == "shell":
-                        command = args["command"]
-                        if self.requires_safety_review(command):
-                            review = await self.safety_review(instruction, command)
-                            if review != "APPROVE":
-                                result = review
-                            elif not await self._confirm_command(command):
-                                result = "Command not executed: user confirmation declined."
-                            else:
-                                result = await Tools.shell_async(command, cwd=str(self.cwd))
-                        else:
-                            result = await Tools.shell_async(command, cwd=str(self.cwd))
-                    else:
-                        confined_args = self._confined_tool_args(call.name, args)
-                        with chdir(self.cwd):
-                            result = getattr(Tools, call.name)(**confined_args)
-                except Exception as error:
-                    result = f"Tool error: {error}"
-                output = bounded(str(result), self.MAX_TOOL_OUTPUT)
-                await self._emit(
-                    ToolFinished(
-                        call.call_id,
-                        call.name,
-                        output,
-                        self.tool_failed(output),
-                        time.monotonic() - started,
-                        self.tool_outcome(output),
-                        self.tool_call_count,
-                        self.activity_group_count,
-                    )
-                )
-                self.visible_transcript.append(("tool", f"{call.name}: {output}"))
-                self.history.append(
-                    {"type": "function_call_output", "call_id": call.call_id, "output": output}
-                )
+                    if state.invalid_responses > self.max_invalid_responses:
+                        return await self._finish(self._limit_message("invalid-response"))
+                    continue
+
+                call = cast(_FunctionCall, calls[0])
+                if state.observe_call(call) > self.max_repeated_calls:
+                    return await self._finish(self._limit_message("repeated-call"))
+
+                output = await self._dispatch_tool(call, instruction)
                 if self.tool_failed(output):
-                    tool_failure_count += 1
-                    if tool_failure_count > self.max_tool_failures:
-                        return await self._finish(
-                            "Turn stopped after reaching the tool-failure limit. "
-                            "The session is intact; ask me to continue."
-                        )
-            return await self._finish(
-                "Turn stopped after reaching the step limit. "
-                "The session is intact; ask me to continue."
-            )
+                    state.tool_failures += 1
+                    if state.tool_failures > self.max_tool_failures:
+                        return await self._finish(self._limit_message("tool-failure"))
+
+            return await self._finish(self._limit_message("step"))
         except (asyncio.CancelledError, KeyboardInterrupt):
             del self.history[checkpoint:]
             del self.visible_transcript[transcript_checkpoint:]
