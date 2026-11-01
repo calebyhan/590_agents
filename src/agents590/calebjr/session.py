@@ -84,7 +84,7 @@ class TurnResult:
 
 @dataclass
 class _LoopState:
-    """Small, explicit state machine for one model/tool turn."""
+    """The three guardrails that keep one model/tool turn finite."""
 
     last_call: tuple[str, str] | None = None
     repeated_calls: int = 0
@@ -98,10 +98,26 @@ class _LoopState:
         return self.repeated_calls
 
 
+@dataclass(frozen=True)
+class _TurnCheckpoint:
+    """Canonical conversation state restored when a turn is cancelled."""
+
+    history_items: int
+    transcript_items: int
+    user_turns: int
+    assistant_turns: int
+    goal: str | None
+
+
 class _FunctionCall(Protocol):
     call_id: str
     name: str
     arguments: str
+
+
+class _ModelResponse(Protocol):
+    output: list[Any]
+    output_text: str | None
 
 
 def _mapping(value: object) -> dict[str, Any]:
@@ -346,7 +362,7 @@ class CalebJRSession:
                 if text:
                     await self._emit(ReasoningSummary(text))
 
-    async def _request_model(self) -> tuple[Any, bool]:
+    async def _request_model(self) -> tuple[_ModelResponse, bool]:
         """Prefer Responses streaming and fall back when the gateway cannot stream."""
         arguments = self._response_arguments(self.history, self.model)
         stream_method = getattr(self.client.responses, "stream", None)
@@ -480,23 +496,101 @@ class CalebJRSession:
         )
         return output
 
+    def _checkpoint(self) -> _TurnCheckpoint:
+        return _TurnCheckpoint(
+            history_items=len(self.history),
+            transcript_items=len(self.visible_transcript),
+            user_turns=self.user_turn_count,
+            assistant_turns=self.assistant_turn_count,
+            goal=self._goal,
+        )
+
+    def _restore(self, checkpoint: _TurnCheckpoint) -> None:
+        """Roll back model context while leaving emitted activity available for inspection."""
+        del self.history[checkpoint.history_items :]
+        del self.visible_transcript[checkpoint.transcript_items :]
+        self.user_turn_count = checkpoint.user_turns
+        self.assistant_turn_count = checkpoint.assistant_turns
+        self._goal = checkpoint.goal
+
+    async def _consume_response(
+        self,
+        response: _ModelResponse,
+        *,
+        streamed_reasoning: bool,
+        instruction: str,
+        state: _LoopState,
+    ) -> TurnResult | None:
+        """Commit one model response, returning a result only when the turn is complete."""
+        self.usage.add_response(response, model=self.model)
+        if not streamed_reasoning:
+            await self._emit_response_reasoning(response)
+        self.history.extend(self._history_item(item) for item in response.output)
+
+        calls = [item for item in response.output if item.type == "function_call"]
+        if not calls:
+            answer = (response.output_text or "").strip()
+            tool_names = "|".join(re.escape(name) for name in TOOL_ARGS)
+            if not re.search(rf"\[({tool_names})\]\(", answer):
+                text = answer.removeprefix("FINAL:").strip() or "No answer generated."
+                return await self._finish(text)
+
+            state.invalid_responses += 1
+            if state.invalid_responses > self.max_invalid_responses:
+                return await self._finish(self._limit_message("invalid-response"))
+            self.history.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Invalid response: use a function call rather than writing a "
+                        "text-based tool call. Please correct the response."
+                    ),
+                }
+            )
+            return None
+
+        if len(calls) != 1:
+            state.invalid_responses += 1
+            error = "Invalid response: make exactly one tool call at a time."
+            self.history.extend(
+                {
+                    "type": "function_call_output",
+                    "call_id": call.call_id,
+                    "output": error,
+                }
+                for call in calls
+            )
+            if state.invalid_responses > self.max_invalid_responses:
+                return await self._finish(self._limit_message("invalid-response"))
+            return None
+
+        call = cast(_FunctionCall, calls[0])
+        if state.observe_call(call) > self.max_repeated_calls:
+            return await self._finish(self._limit_message("repeated-call"))
+
+        output = await self._dispatch_tool(call, instruction)
+        if self.tool_failed(output):
+            state.tool_failures += 1
+            if state.tool_failures > self.max_tool_failures:
+                return await self._finish(self._limit_message("tool-failure"))
+        return None
+
     async def run_turn(self, instruction: str) -> TurnResult:
         """Run one turn, retaining complete response/tool history for the next turn."""
         if not instruction.strip():
             raise ValueError("instruction must not be blank")
         if self.context_characters() > self.context_budget:
             await self.compact()
-        checkpoint = len(self.history)
-        transcript_checkpoint = len(self.visible_transcript)
-        counters = (self.user_turn_count, self.assistant_turn_count, self.tool_call_count)
+
+        checkpoint = self._checkpoint()
         self.history.append({"role": "user", "content": instruction})
         self.visible_transcript.append(("user", instruction))
         self.user_turn_count += 1
-        if self._goal is None:
-            self._goal = instruction
+        self._goal = self._goal or instruction
         self.activity_group_count += 1
         await self._emit(TurnStarted(instruction))
         await self._emit(Progress("Processing request."))
+
         state = _LoopState()
         try:
             for _ in range(self.max_steps):
@@ -504,70 +598,25 @@ class CalebJRSession:
                     response, streamed_reasoning = await self._request_model()
                 except Exception as error:
                     kind = self.failure_kind(error)
-                    text = (
+                    message = (
                         f"Model request {kind}: {error}"
                         if kind != "model"
                         else f"Model request failed: {error}"
                     )
-                    return await self._finish_failure(text, kind)
-                self.usage.add_response(response, model=self.model)
-                if not streamed_reasoning:
-                    await self._emit_response_reasoning(response)
-                self.history.extend(self._history_item(item) for item in response.output)
-                calls = [item for item in response.output if item.type == "function_call"]
-                if not calls:
-                    answer = (response.output_text or "").strip()
-                    tool_names = "|".join(re.escape(name) for name in TOOL_ARGS)
-                    if not re.search(rf"\[({tool_names})\]\(", answer):
-                        text = answer.removeprefix("FINAL:").strip() or "No answer generated."
-                        return await self._finish(text)
+                    return await self._finish_failure(message, kind)
 
-                    state.invalid_responses += 1
-                    if state.invalid_responses > self.max_invalid_responses:
-                        return await self._finish(self._limit_message("invalid-response"))
-                    self.history.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "Invalid response: use a function call rather than writing a "
-                                "text-based tool call. Please correct the response."
-                            ),
-                        }
-                    )
-                    continue
-
-                if len(calls) != 1:
-                    state.invalid_responses += 1
-                    error = "Invalid response: make exactly one tool call at a time."
-                    self.history.extend(
-                        {
-                            "type": "function_call_output",
-                            "call_id": call.call_id,
-                            "output": error,
-                        }
-                        for call in calls
-                    )
-                    if state.invalid_responses > self.max_invalid_responses:
-                        return await self._finish(self._limit_message("invalid-response"))
-                    continue
-
-                call = cast(_FunctionCall, calls[0])
-                if state.observe_call(call) > self.max_repeated_calls:
-                    return await self._finish(self._limit_message("repeated-call"))
-
-                output = await self._dispatch_tool(call, instruction)
-                if self.tool_failed(output):
-                    state.tool_failures += 1
-                    if state.tool_failures > self.max_tool_failures:
-                        return await self._finish(self._limit_message("tool-failure"))
+                result = await self._consume_response(
+                    response,
+                    streamed_reasoning=streamed_reasoning,
+                    instruction=instruction,
+                    state=state,
+                )
+                if result is not None:
+                    return result
 
             return await self._finish(self._limit_message("step"))
         except (asyncio.CancelledError, KeyboardInterrupt):
-            del self.history[checkpoint:]
-            del self.visible_transcript[transcript_checkpoint:]
-            self.user_turn_count, self.assistant_turn_count = counters[:2]
-            if not self.user_turn_count:
-                self._goal = None
+            self._restore(checkpoint)
             await self._emit(TurnCancelled())
             raise
 
